@@ -90,6 +90,8 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 6    | `ContractPaused`      | The admin has paused the vault; only `cancel_stream` still works.        |
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
 | 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
+| 9    | `ArithmeticOverflow`  | A balance or stream-id arithmetic operation would exceed its type's range. |
+| 10   | `InvalidAdmin`        | An admin transfer proposed an invalid replacement, such as the current admin itself. |
 
 ### `ngo-registry`
 

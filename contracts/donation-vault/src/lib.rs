@@ -63,6 +63,8 @@ pub enum Error {
     /// leave its type's range. Returned instead of letting the release
     /// profile's overflow checks panic and abort the transaction.
     ArithmeticOverflow = 9,
+    /// The proposed administrator is not a valid replacement.
+    InvalidAdmin = 10,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -270,7 +272,10 @@ impl DonationVault {
     /// assert_eq!(client.admin(), admin);
     /// ```
     pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        require_admin(&env)?;
+        let current_admin = require_admin(&env)?;
+        if new_admin == current_admin {
+            return Err(Error::InvalidAdmin);
+        }
 
         env.storage()
             .instance()
