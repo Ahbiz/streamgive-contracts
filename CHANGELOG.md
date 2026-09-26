@@ -19,6 +19,10 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: optional protocol fee (`set_fee_bps` / `fee_bps`) with
   treasury payout (`set_treasury` / `treasury`).
 - `donation-vault`: read-only `pending_accrual` view.
+- `donation-vault`: regression coverage for one-stroop-per-second streams and
+  their zero-rounded protocol fee.
+- `DataKey` enums now derive `Debug` in both contracts for clearer storage-key
+  diagnostics.
 - `donation-vault`: two-step admin transfer via `propose_admin` /
   `accept_admin`.
 - `ngo-registry`: contract skeleton with storage types and `init`.

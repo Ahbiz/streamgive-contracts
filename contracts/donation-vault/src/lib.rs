@@ -36,7 +36,7 @@ pub struct Stream {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
     PendingAdmin,
