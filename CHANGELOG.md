@@ -18,6 +18,8 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: admin-gated `pause` / `unpause` for fund-moving actions.
 - `donation-vault`: optional protocol fee (`set_fee_bps` / `fee_bps`) with
   treasury payout (`set_treasury` / `treasury`).
+- `donation-vault`: admin-configurable `cancel_grace_ledgers` retention for
+  cancelled streams, with TTL coverage for indexing after cancellation.
 - `donation-vault`: read-only `pending_accrual` view.
 - `donation-vault`: two-step admin transfer via `propose_admin` /
   `accept_admin`.
@@ -32,6 +34,8 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `scripts/deploy-testnet.sh` for deploying both contracts to testnet.
 - CI workflow running `cargo fmt --check`, `cargo clippy`, a
   `wasm32v1-none` release build, and `cargo test --workspace`.
+- README FAQ covering the license, release overflow checks, `no_std`, storage
+  TTLs, and cancelled-stream retention.
 
 ### Changed
 

@@ -776,6 +776,24 @@ fn cancel_stream_bumps_instance_and_stream_ttl() {
 }
 
 #[test]
+fn cancel_stream_applies_configured_grace_period() {
+    let s = setup();
+    let stream_id = create_ttl_test_stream(&s);
+    let grace_ledgers = 14 * DAY_IN_LEDGERS;
+
+    s.client.set_cancel_grace_ledgers(&grace_ledgers);
+    assert_eq!(s.client.cancel_grace_ledgers(), grace_ledgers);
+    age_past_thresholds(&s, Some(stream_id));
+
+    s.client.cancel_stream(&stream_id);
+
+    assert_eq!(
+        stream_ttl(&s, stream_id),
+        STREAM_BUMP_AMOUNT + grace_ledgers
+    );
+}
+
+#[test]
 fn top_up_bumps_instance_and_stream_ttl() {
     let s = setup();
     let stream_id = create_ttl_test_stream(&s);
