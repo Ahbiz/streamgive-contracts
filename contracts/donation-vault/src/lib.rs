@@ -8,7 +8,7 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
 };
 
 mod math;
@@ -45,6 +45,7 @@ pub enum DataKey {
     Paused,
     Treasury,
     FeeBps,
+    AllowedTokens,
 }
 
 #[contracterror]
@@ -666,6 +667,15 @@ impl DonationVault {
     /// ```
     pub fn fee_bps(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
+    }
+
+    /// Returns the configured token allowlist for frontend token pickers.
+    /// Until an allowlist is configured, this returns an empty vector.
+    pub fn allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Opens a new stream: pulls `deposit` of `token` from the donor into the

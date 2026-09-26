@@ -242,6 +242,13 @@ fn propose_then_accept_admin_transfers_control() {
 }
 
 #[test]
+fn allowed_tokens_is_empty_when_unconfigured() {
+    let s = setup();
+
+    assert_eq!(s.client.allowed_tokens().len(), 0);
+}
+
+#[test]
 fn accept_admin_without_proposal_fails() {
     let s = setup();
     let result = s.client.try_accept_admin();

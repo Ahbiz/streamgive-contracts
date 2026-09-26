@@ -19,6 +19,7 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: optional protocol fee (`set_fee_bps` / `fee_bps`) with
   treasury payout (`set_treasury` / `treasury`).
 - `donation-vault`: read-only `pending_accrual` view.
+- `donation-vault`: read-only `allowed_tokens` getter for frontend token pickers.
 - `donation-vault`: two-step admin transfer via `propose_admin` /
   `accept_admin`.
 - `ngo-registry`: contract skeleton with storage types and `init`.
