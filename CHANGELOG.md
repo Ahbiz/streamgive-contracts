@@ -38,5 +38,8 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: stream `balance`/`withdrawn` updates and the stream-id
   counter use checked arithmetic, returning `Error::ArithmeticOverflow`
   instead of panicking on overflow.
+- `donation-vault`: `create_stream` rejects a stream whose `donor` and `ngo`
+  are the same address with `Error::SelfStream`, so a deposit can't be
+  counted as a committed donation while streaming straight back to its donor.
 
 [Unreleased]: https://github.com/StreamGive/streamgive-contracts/compare/main...HEAD

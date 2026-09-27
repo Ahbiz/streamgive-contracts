@@ -209,6 +209,40 @@ fn create_stream_rejects_non_positive_amounts() {
 }
 
 #[test]
+fn create_stream_rejects_donor_equal_to_ngo() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // A donor streaming to itself would pay the deposit straight back out
+    // while the indexer counted it as a committed donation, so the vault
+    // refuses the stream outright.
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.donor, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::SelfStream)));
+
+    // The rejected call is a no-op: no deposit is pulled, no stream id is
+    // handed out, and the donor keeps every unit.
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+    assert_eq!(s.token.balance(&s.client.address), 0);
+    assert_eq!(s.client.stream_count(), 0);
+}
+
+#[test]
+fn create_stream_checks_the_parties_before_the_amounts() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Both arguments are bad. The donor/NGO pair is validated before the
+    // amounts, so the caller gets SelfStream rather than InvalidAmount —
+    // worth pinning so the order can't quietly flip.
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.donor, &s.token.address, &0, &10);
+    assert_eq!(result, Err(Ok(Error::SelfStream)));
+}
+
+#[test]
 fn propose_then_accept_admin_transfers_control() {
     let s = setup();
     let old_admin = s.client.admin();
