@@ -116,7 +116,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 1    | `AlreadyInitialized`  | `init` was already called; the vault already has an admin.               |
 | 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.          |
 | 3    | `StreamNotFound`      | No stream exists for the given stream id.                                |
-| 4    | `InvalidAmount`       | `deposit` or `rate` passed to `create_stream` was zero or negative.      |
+| 4    | `InvalidAmount`       | `deposit` or `rate` passed to `create_stream`, the `amount` passed to `top_up`, or the `new_rate` passed to `modify_rate` was zero or negative. |
 | 5    | `NothingToWithdraw`   | The stream has accrued nothing since its last checkpoint.                |
 | 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
