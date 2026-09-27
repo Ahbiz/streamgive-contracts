@@ -379,6 +379,27 @@ fn withdraw_with_nothing_accrued_fails() {
 }
 
 #[test]
+fn withdraw_immediately_after_top_up_fails() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10); // 100 accrues
+
+    // top_up settles the accrued 100 to the NGO internally.
+    s.client.top_up(&stream_id, &500);
+    assert_eq!(s.token.balance(&s.ngo), 100);
+
+    // No time has passed since the settlement, so nothing new has accrued.
+    let result = s.client.try_withdraw(&stream_id);
+    assert_eq!(result, Err(Ok(Error::NothingToWithdraw)));
+    assert_eq!(s.token.balance(&s.ngo), 100);
+}
+
+#[test]
 fn pause_blocks_create_but_not_cancel() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
