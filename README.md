@@ -131,6 +131,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.  |
 | 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
 | 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
+| 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved; the approved name is locked. |
 
 ## Status
 
