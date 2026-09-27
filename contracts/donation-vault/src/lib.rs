@@ -749,9 +749,7 @@ impl DonationVault {
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
-        let next_stream_id = stream_id
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
+        let next_stream_id = stream_id.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         env.storage()
             .instance()
             .set(&DataKey::NextStreamId, &next_stream_id);
@@ -858,10 +856,11 @@ impl DonationVault {
     ///
     /// // Settles the 200 already accrued to the NGO, refunds the
     /// // untouched 800 to the donor, and zeroes the stream out.
-    /// client.cancel_stream(&stream_id);
+    /// let refund = client.cancel_stream(&stream_id);
+    /// assert_eq!(refund, 800);
     /// assert_eq!(client.get_stream(&stream_id).balance, 0);
     /// ```
-    pub fn cancel_stream(env: Env, stream_id: u64) -> Result<(), Error> {
+    pub fn cancel_stream(env: Env, stream_id: u64) -> Result<i128, Error> {
         let key = DataKey::Stream(stream_id);
         let mut stream: Stream = env
             .storage()
@@ -897,7 +896,7 @@ impl DonationVault {
         env.events()
             .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
 
-        Ok(())
+        Ok(refund)
     }
 
     /// Adds more funds to an existing stream. Donor-auth-gated. Settles
