@@ -61,6 +61,48 @@ fn double_register_fails() {
 }
 
 #[test]
+fn ngo_count_initially_zero() {
+    let (_env, client, _admin) = setup();
+    assert_eq!(client.ngo_count(), 0);
+}
+
+#[test]
+fn register_increments_ngo_count() {
+    let (env, client, _admin) = setup();
+    assert_eq!(client.ngo_count(), 0);
+
+    let owner1 = Address::generate(&env);
+    client.register(&owner1, &String::from_str(&env, "First NGO"));
+    assert_eq!(client.ngo_count(), 1);
+
+    let owner2 = Address::generate(&env);
+    client.register(&owner2, &String::from_str(&env, "Second NGO"));
+    assert_eq!(client.ngo_count(), 2);
+
+    // Duplicate registration should fail and not increment the count
+    let result = client.try_register(&owner1, &String::from_str(&env, "First NGO Again"));
+    assert_eq!(result, Err(Ok(Error::AlreadyRegistered)));
+    assert_eq!(client.ngo_count(), 2);
+
+    // Approving, revoking, renaming, or touching an NGO does not increment count
+    client.approve_ngo(&owner1);
+    assert_eq!(client.ngo_count(), 2);
+
+    client.revoke_ngo(&owner1);
+    assert_eq!(client.ngo_count(), 2);
+
+    client.update_name(&owner2, &String::from_str(&env, "Renamed NGO"));
+    assert_eq!(client.ngo_count(), 2);
+
+    client.touch_ngo(&owner2);
+    assert_eq!(client.ngo_count(), 2);
+
+    let owner3 = Address::generate(&env);
+    client.register(&owner3, &String::from_str(&env, "Third NGO"));
+    assert_eq!(client.ngo_count(), 3);
+}
+
+#[test]
 fn get_unregistered_ngo_fails() {
     let (env, client, _admin) = setup();
     let random = Address::generate(&env);
