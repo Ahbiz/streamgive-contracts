@@ -38,6 +38,21 @@ pub struct Stream {
     pub status: StreamStatus,
 }
 
+/// Explicit lifecycle state of a stream. Prior to this field a client had
+/// to inspect `rate`, `balance`, and `withdrawn` together to infer state;
+/// the enum makes it queryable directly. See issue #92.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StreamStatus {
+    /// Normal state: rate > 0, balance > 0.
+    Active,
+    /// Donor cancelled. Balance and rate are both zero.
+    Cancelled,
+    /// The stream ran to completion: the last withdrawal brought balance
+    /// to zero without a cancel.
+    Drained,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -72,9 +87,14 @@ pub enum Error {
     /// leave its type's range. Returned instead of letting the release
     /// profile's overflow checks panic and abort the transaction.
     ArithmeticOverflow = 9,
+    /// The donor and the NGO are the same address, so the stream would pay
+    /// the donor back their own deposit. Rejected at creation: a stream that
+    /// nets to zero still counts as a committed donation in the indexer and
+    /// on impact pages, which is a way to inflate those totals for free.
+    SelfStream = 10,
     /// The donor already has `max_streams_per_donor` streams. Raised by
     /// `create_stream` before the deposit is pulled. See issue #94.
-    StreamLimitExceeded = 10,
+    StreamLimitExceeded = 11,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -242,9 +262,7 @@ impl DonationVault {
     }
 
     /// Reads back the address proposed by `propose_admin`, if any hasn't
-    /// yet been accepted or cancelled. Lets the proposed admin (or anyone
-    /// else) check whether there's something to accept without having to
-    /// watch for the `propadmin` event.
+    /// yet been accepted or cancelled.
     ///
     /// # Examples
     ///
@@ -268,8 +286,6 @@ impl DonationVault {
     }
 
     /// Starts a two-step admin transfer by recording `new_admin` as pending.
-    /// Requires the current admin's auth. Has no effect on who can act as
-    /// admin until `accept_admin` is called by the proposed address.
     ///
     /// # Examples
     ///
@@ -301,9 +317,7 @@ impl DonationVault {
         Ok(())
     }
 
-    /// Completes a two-step admin transfer. Requires the proposed admin's
-    /// auth. Fails with `Error::NoPendingAdmin` if `propose_admin` was never
-    /// called, or has already been completed.
+    /// Completes a two-step admin transfer.
     ///
     /// # Examples
     ///
@@ -338,10 +352,7 @@ impl DonationVault {
         Ok(())
     }
 
-    /// Withdraws a pending admin proposal, leaving nothing pending. Requires
-    /// the current admin's auth. Fails with `Error::NoPendingAdmin` if
-    /// `propose_admin` was never called, or the proposal was already
-    /// accepted or cancelled.
+    /// Withdraws a pending admin proposal, leaving nothing pending.
     ///
     /// # Examples
     ///
@@ -411,9 +422,7 @@ impl DonationVault {
     }
 
     /// Reads back the number of streams ever created — the exclusive upper
-    /// bound on valid stream ids. Lets a client enumerate streams (ids `0`
-    /// through `stream_count() - 1`) or just show a running total, without
-    /// exposing the raw `NextStreamId` counter directly.
+    /// bound on valid stream ids.
     ///
     /// # Examples
     ///
@@ -445,8 +454,6 @@ impl DonationVault {
     }
 
     /// Read-only lookup of how much a stream has accrued to the NGO so far.
-    /// Reuses the same math `withdraw` would use to pay out, but never
-    /// mutates storage or moves funds — safe to call as often as needed.
     ///
     /// # Examples
     ///
@@ -485,9 +492,6 @@ impl DonationVault {
     }
 
     /// Bumps a stream's persistent-storage TTL without touching its state.
-    /// Callable by anyone — donor, NGO, or a keeper bot — so a slow,
-    /// long-running stream that nobody happens to write to doesn't get
-    /// archived out from under its funds between activity.
     ///
     /// # Examples
     ///
@@ -520,8 +524,6 @@ impl DonationVault {
     }
 
     /// Halts stream creation, withdrawal, top-up, and rate changes.
-    /// Admin-gated emergency brake; existing balances stay put and
-    /// `cancel_stream` still works so donors can always get a refund.
     ///
     /// # Examples
     ///
@@ -635,9 +637,7 @@ impl DonationVault {
         env.storage().instance().get(&DataKey::Treasury)
     }
 
-    /// Sets the protocol fee, in basis points, taken out of accrued payouts
-    /// to the NGO. Admin-gated, capped at `MAX_FEE_BPS`. Has no effect
-    /// unless a treasury is also set.
+    /// Sets the protocol fee, in basis points.
     ///
     /// # Examples
     ///
@@ -688,12 +688,13 @@ impl DonationVault {
 
     /// Opens a new stream: pulls `deposit` of `token` from the donor into the
     /// vault, to be released to the NGO at `rate` per second on withdrawal.
+    /// `donor` and `ngo` must be distinct addresses.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// # use soroban_sdk::{testutils::Address as _, token, Address, Env};
-    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # use donation_vault::{DonationVault, DonationVaultClient, Error};
     /// # let env = Env::default();
     /// # env.mock_all_auths();
     /// # let contract_id = env.register(DonationVault, ());
@@ -709,6 +710,11 @@ impl DonationVault {
     /// // Stream 1_000 units of the token to `ngo` at 10 units/second.
     /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
     /// assert_eq!(client.get_stream(&stream_id).balance, 1_000);
+    ///
+    /// // A stream needs two distinct parties — the vault refuses to pay a
+    /// // donor back their own deposit.
+    /// let result = client.try_create_stream(&donor, &donor, &sac.address(), &1_000, &10);
+    /// assert_eq!(result, Err(Ok(Error::SelfStream)));
     /// ```
     pub fn create_stream(
         env: Env,
@@ -720,6 +726,13 @@ impl DonationVault {
     ) -> Result<u64, Error> {
         require_not_paused(&env)?;
         donor.require_auth();
+
+        // Checked before the deposit is pulled and before the amounts are
+        // validated: a self-stream is never a legitimate call regardless of
+        // how the other arguments look, and it must not reach the transfer.
+        if donor == ngo {
+            return Err(Error::SelfStream);
+        }
 
         if deposit <= 0 || rate <= 0 {
             return Err(Error::InvalidAmount);
@@ -766,9 +779,7 @@ impl DonationVault {
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
-        let next_stream_id = stream_id
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
+        let next_stream_id = stream_id.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         env.storage()
             .instance()
             .set(&DataKey::NextStreamId, &next_stream_id);
@@ -862,10 +873,9 @@ impl DonationVault {
     }
 
     /// Stops a stream for good: settles whatever has already accrued to the
-    /// NGO (so cancelling doesn't claw back funds already earned), refunds
-    /// the untouched remainder to the donor, then zeroes the stream's rate
-    /// and balance. Donor-auth-gated. The record is kept, not deleted, so
-    /// the stream's history stays queryable.
+    /// NGO, refunds the untouched remainder to the donor, then zeroes the
+    /// stream's rate and balance. Donor-auth-gated. Returns the refunded
+    /// amount.
     ///
     /// # Examples
     ///
@@ -889,10 +899,11 @@ impl DonationVault {
     ///
     /// // Settles the 200 already accrued to the NGO, refunds the
     /// // untouched 800 to the donor, and zeroes the stream out.
-    /// client.cancel_stream(&stream_id);
+    /// let refund = client.cancel_stream(&stream_id);
+    /// assert_eq!(refund, 800);
     /// assert_eq!(client.get_stream(&stream_id).balance, 0);
     /// ```
-    pub fn cancel_stream(env: Env, stream_id: u64) -> Result<(), Error> {
+    pub fn cancel_stream(env: Env, stream_id: u64) -> Result<i128, Error> {
         let key = DataKey::Stream(stream_id);
         let mut stream: Stream = env
             .storage()
@@ -929,12 +940,10 @@ impl DonationVault {
         env.events()
             .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
 
-        Ok(())
+        Ok(refund)
     }
 
-    /// Adds more funds to an existing stream. Donor-auth-gated. Settles
-    /// whatever has already accrued to the NGO first, so the top-up only
-    /// ever affects accrual going forward.
+    /// Adds more funds to an existing stream. Donor-auth-gated.
     ///
     /// # Examples
     ///
@@ -1003,8 +1012,6 @@ impl DonationVault {
     }
 
     /// Changes the per-second accrual rate on an existing stream. Donor-auth-gated.
-    /// Settles whatever has already accrued at the old rate first, so the new
-    /// rate only ever applies going forward — never retroactively.
     ///
     /// # Examples
     ///
@@ -1066,9 +1073,7 @@ impl DonationVault {
         Ok(())
     }
 
-    /// Sets the per-donor stream cap. Admin-gated. Applies only to streams
-    /// created after the call — lowering the cap does not affect a donor
-    /// who already has more than the new limit.
+    /// Sets the per-donor stream cap. Admin-gated.
     ///
     /// # Examples
     ///
