@@ -31,6 +31,11 @@ This project does not yet follow a formal versioning scheme — each contract's
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
 - `scripts/deploy-testnet.sh` for deploying both contracts to testnet.
+- `scripts/deploy-mainnet.sh` for deploying to mainnet. It requires
+  `--confirm`, pins the Public network passphrase, requires an explicit
+  admin address, refuses to overwrite an existing entry, and records the
+  contract IDs under a separate `mainnet` key in `deployments.json`.
+  `deploy-testnet.sh` now preserves that key when it rewrites the file.
 - CI workflow running `cargo fmt --check`, `cargo clippy`, a
   `wasm32v1-none` release build, and `cargo test --workspace`.
 
