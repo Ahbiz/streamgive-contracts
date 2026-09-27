@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
 use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
-use soroban_sdk::{IntoVal, Symbol};
+use soroban_sdk::{vec, IntoVal, Symbol, Val, Vec};
 
 fn setup() -> (Env, NgoRegistryClient<'static>, Address) {
     let env = Env::default();
@@ -252,6 +252,19 @@ fn update_name_changes_name_before_approval() {
 
     let fixed = String::from_str(&env, "Red Cross");
     client.update_name(&owner, &fixed);
+
+    // Events cover only the latest top-level call, so read them before
+    // `get_ngo` below replaces them.
+    let events = env.events().all();
+    let expected: Vec<(Address, Vec<Val>, Val)> = vec![
+        &env,
+        (
+            client.address.clone(),
+            (symbol_short!("renamed"), owner.clone()).into_val(&env),
+            fixed.into_val(&env),
+        ),
+    ];
+    assert_eq!(events, expected);
 
     assert_eq!(
         env.events().all(),

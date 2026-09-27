@@ -2,9 +2,34 @@
 
 use super::*;
 use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
-use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Ledger, MockAuth, MockAuthInvoke};
+use soroban_sdk::testutils::{
+    Address as _, AuthorizedFunction, Events as _, Ledger, MockAuth, MockAuthInvoke,
+};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-use soroban_sdk::{IntoVal, Symbol, Val, Vec};
+use soroban_sdk::xdr::{ContractEventBody, ScVal, ScVec};
+use soroban_sdk::{IntoVal, Symbol, TryFromVal, Val, Vec};
+
+/// The most recently published event, in XDR form. `Val` has no `PartialEq`,
+/// so it compares against an expected `(topics, data)` pair by converting
+/// that pair to XDR too.
+struct LastEvent {
+    env: Env,
+    topics: ScVal,
+    data: ScVal,
+}
+
+impl core::fmt::Debug for LastEvent {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "({:?}, {:?})", self.topics, self.data)
+    }
+}
+
+impl PartialEq<(Vec<Val>, Val)> for LastEvent {
+    fn eq(&self, (topics, data): &(Vec<Val>, Val)) -> bool {
+        ScVal::try_from_val(&self.env, &topics.to_val()).unwrap() == self.topics
+            && ScVal::try_from_val(&self.env, data).unwrap() == self.data
+    }
+}
 
 use soroban_sdk::TryFromVal as _;
 
@@ -36,9 +61,13 @@ impl PartialEq<(Vec<Val>, Val)> for LastEvent {
 /// which contract emitted it — vault entry points always publish their own
 /// event last, after any token transfer, so this is the vault's event.
 fn last_event(env: &Env) -> LastEvent {
-    use soroban_sdk::testutils::Events as _;
-    let event = env.events().all().events().last().cloned().unwrap();
-    LastEvent(env.clone(), event)
+    let all = env.events().all();
+    let ContractEventBody::V0(body) = &all.events().last().unwrap().body;
+    LastEvent {
+        env: env.clone(),
+        topics: ScVal::Vec(Some(ScVec(body.topics.clone()))),
+        data: body.data.clone(),
+    }
 }
 
 fn create_token<'a>(env: &Env, admin: &Address) -> (TokenClient<'a>, StellarAssetClient<'a>) {
@@ -103,6 +132,8 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
+    // `last_event` only sees the latest top-level call, so assert it before
+    // any other call (such as a balance read) replaces it.
     assert_eq!(
         last_event(&s.env),
         (
@@ -124,6 +155,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     s.env.ledger().with_mut(|l| l.timestamp += 50);
 
     let withdrawn = s.client.withdraw(&stream_id);
+    assert_eq!(withdrawn, 500);
     assert_eq!(
         last_event(&s.env),
         (
@@ -131,7 +163,6 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
             500i128.into_val(&s.env),
         )
     );
-    assert_eq!(withdrawn, 500);
     assert_eq!(s.token.balance(&s.ngo), 500);
 
     let stream = s.client.get_stream(&stream_id);
@@ -140,6 +171,9 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
 
     // 20 more seconds pass, then the donor cancels.
     s.env.ledger().with_mut(|l| l.timestamp += 20);
+    s.client.cancel_stream(&stream_id);
+
+    // 200 more settles to the NGO on cancel; the untouched 300 refunds to the donor.
     let refund = s.client.cancel_stream(&stream_id);
     assert_eq!(refund, 300);
     assert_eq!(
@@ -149,6 +183,8 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
             (200i128, 300i128).into_val(&s.env),
         )
     );
+    assert_eq!(s.token.balance(&s.ngo), 700);
+    assert_eq!(s.token.balance(&s.donor), 300);
 
     // 200 more settles to the NGO on cancel; the untouched 300 refunds to the donor.
     assert_eq!(s.token.balance(&s.ngo), 700);
@@ -157,6 +193,56 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     let stream = s.client.get_stream(&stream_id);
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
+}
+
+#[test]
+fn concurrent_streams_to_one_ngo_accrue_and_pay_out_independently() {
+    let s = setup();
+    let donor_b = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &1_000);
+    s.token_admin.mint(&donor_b, &600);
+
+    // Stream A starts first; stream B starts 20 seconds later at a
+    // different rate, so the two accruals differ.
+    let id_a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 20);
+    let id_b = s
+        .client
+        .create_stream(&donor_b, &s.ngo, &s.token.address, &600, &5);
+    assert_ne!(id_a, id_b);
+    assert_eq!(s.token.balance(&s.client.address), 1_600);
+
+    // 30 seconds later: A has run 50s (500), B has run 30s (150).
+    s.env.ledger().with_mut(|l| l.timestamp += 30);
+    assert_eq!(s.client.pending_accrual(&id_a), 500);
+    assert_eq!(s.client.pending_accrual(&id_b), 150);
+
+    // Withdrawing A pays exactly A's accrual and leaves B untouched.
+    assert_eq!(s.client.withdraw(&id_a), 500);
+    assert_eq!(s.token.balance(&s.ngo), 500);
+    assert_eq!(s.client.pending_accrual(&id_b), 150);
+    let stream_b = s.client.get_stream(&id_b);
+    assert_eq!(stream_b.balance, 600);
+    assert_eq!(stream_b.withdrawn, 0);
+
+    // Withdrawing B pays exactly B's accrual and leaves A untouched.
+    assert_eq!(s.client.withdraw(&id_b), 150);
+    assert_eq!(s.token.balance(&s.ngo), 650);
+
+    let stream_a = s.client.get_stream(&id_a);
+    assert_eq!(stream_a.balance, 500);
+    assert_eq!(stream_a.withdrawn, 500);
+    let stream_b = s.client.get_stream(&id_b);
+    assert_eq!(stream_b.balance, 450);
+    assert_eq!(stream_b.withdrawn, 150);
+    assert_eq!(s.token.balance(&s.client.address), 950);
+
+    // Both keep accruing at their own rates after the other's withdrawal.
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    assert_eq!(s.client.pending_accrual(&id_a), 100);
+    assert_eq!(s.client.pending_accrual(&id_b), 50);
 }
 
 #[test]
