@@ -3,6 +3,9 @@
 Soroban smart contracts powering StreamGive, a recurring/streaming donation
 platform for verified NGOs on Stellar.
 
+For how these contracts fit with the backend and frontend — and how a
+donation flows end to end — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Contracts
 
 - `ngo-registry` — on-chain NGO application, verification, and registry
