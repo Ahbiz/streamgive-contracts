@@ -31,6 +31,37 @@ Change these with care: relaxing `opt-level`, `lto`, or `strip` grows the
 deployed wasm and raises fees, while turning `overflow-checks` off would
 let balance arithmetic wrap silently.
 
+## Pausing
+
+`donation-vault` has an admin-gated `pause` / `unpause` pair — an
+emergency brake for when something is wrong. `pause` only flips a flag in
+the instance storage: no funds are moved, so every balance stays exactly
+where it was and there is nothing to unwind when the pause is lifted.
+
+While the vault is paused, every entry point that moves tokens or changes
+a stream rejects the call with `Error::ContractPaused` (code 6) before
+touching storage or requiring any auth:
+
+| Entry point     | While paused                                    |
+| --------------- | ----------------------------------------------- |
+| `create_stream` | Rejected                                        |
+| `withdraw`      | Rejected                                        |
+| `top_up`        | Rejected                                        |
+| `modify_rate`   | Rejected                                        |
+| `cancel_stream` | Still works — settles and refunds as usual      |
+
+`withdraw` being on that list is the point of the brake: it is the only
+path that pays tokens straight out of the vault, so a pause triggered by a
+suspected vulnerability has to close it or an attacker could simply drain
+funds while the rest of the contract is frozen.
+
+`cancel_stream` is deliberately left open. It is the one path that returns
+money to a donor, so keeping it available means a pause can never trap a
+donor's unspent deposit. The read-only views (`admin`, `pending_admin`,
+`get_stream`, `stream_count`, `pending_accrual`, `paused`, `treasury`,
+`fee_bps`) and `extend_stream` also keep working, since none of them can
+move funds, and `unpause` is of course still reachable.
+
 ## Related repositories
 
 - [streamgive-backend](https://github.com/streamgive/streamgive-backend) — indexer & API
@@ -87,7 +118,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 3    | `StreamNotFound`      | No stream exists for the given stream id.                                |
 | 4    | `InvalidAmount`       | `deposit` or `rate` passed to `create_stream` was zero or negative.      |
 | 5    | `NothingToWithdraw`   | The stream has accrued nothing since its last checkpoint.                |
-| 6    | `ContractPaused`      | The admin has paused the vault; only `cancel_stream` still works.        |
+| 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
 | 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
 

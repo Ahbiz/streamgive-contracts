@@ -342,6 +342,37 @@ fn pause_blocks_create_but_not_cancel() {
 }
 
 #[test]
+fn pause_blocks_withdraw_but_not_cancel() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 has accrued
+
+    s.client.pause();
+
+    // withdraw is the one entry point that pays tokens straight out of the
+    // vault, so the brake has to stop it even with funds already waiting to
+    // be claimed — otherwise pausing buys no protection at all.
+    let result = s.client.try_withdraw(&stream_id);
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+
+    // The rejected call is a no-op: nothing moves, and the accrual it would
+    // have settled stays on the stream for after the pause is lifted.
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 1_000);
+    assert_eq!(stream.withdrawn, 0);
+
+    // Cancelling still works while paused, so donors are never trapped.
+    s.client.cancel_stream(&stream_id);
+    assert_eq!(s.token.balance(&s.ngo), 500);
+    assert_eq!(s.token.balance(&s.donor), 500);
+}
+
+#[test]
 fn unpause_restores_normal_operation() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
