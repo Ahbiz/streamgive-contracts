@@ -33,6 +33,9 @@ pub struct Stream {
     pub withdrawn: i128,
     pub created_at: u64,
     pub last_update: u64,
+    /// Explicit lifecycle state. Set to Active at creation, Cancelled on
+    /// cancel_stream, and Drained when withdraw brings balance to zero.
+    pub status: StreamStatus,
 }
 
 #[contracttype]
@@ -757,6 +760,7 @@ impl DonationVault {
             withdrawn: 0,
             created_at: now,
             last_update: now,
+            status: StreamStatus::Active,
         };
 
         env.storage()
@@ -841,6 +845,9 @@ impl DonationVault {
 
         record_payout(&mut stream, accrued)?;
         stream.last_update = now;
+        if stream.balance == 0 {
+            stream.status = StreamStatus::Drained;
+        }
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
@@ -914,6 +921,7 @@ impl DonationVault {
         stream.balance = 0;
         stream.rate = 0;
         stream.last_update = now;
+        stream.status = StreamStatus::Cancelled;
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);

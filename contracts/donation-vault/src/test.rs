@@ -704,6 +704,7 @@ fn create_stream_stores_every_field() {
             withdrawn: 0,
             created_at: 12_345,
             last_update: 12_345,
+            status: StreamStatus::Active,
         }
     );
 }
@@ -1152,4 +1153,60 @@ fn separate_donors_have_separate_counters() {
     // But donor_b is now at its own cap.
     let result = s.client.try_create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
     assert!(result.is_err());
+}
+
+
+// =============================================================================
+// Explicit stream status (issue #92)
+// =============================================================================
+
+#[test]
+fn new_stream_starts_active() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+}
+
+#[test]
+fn cancelled_stream_reports_cancelled() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Cancelled);
+}
+
+#[test]
+fn fully_withdrawn_stream_reports_drained() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    // 10 units/s for 1000 units ? fully drained after 100 seconds.
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+    s.client.withdraw(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Drained);
+}
+
+#[test]
+fn partially_withdrawn_stream_stays_active() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+    s.client.withdraw(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+}
+
+#[test]
+fn status_is_queryable_after_cancel_then_further_operations_fail() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Cancelled);
+    // top_up on a cancelled stream is rejected (cancelled sets rate = 0).
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    let result = s.client.try_withdraw(&stream_id);
+    assert!(result.is_err()); // nothing left to withdraw
 }
