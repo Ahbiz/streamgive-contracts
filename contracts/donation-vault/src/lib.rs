@@ -45,6 +45,12 @@ pub enum DataKey {
     Paused,
     Treasury,
     FeeBps,
+    /// Admin-settable per-donor stream cap. See `set_max_streams_per_donor`.
+    MaxStreamsPerDonor,
+    /// Count of streams a donor currently has open. Incremented on
+    /// `create_stream`, never decremented (streams are cancelled, not
+    /// deleted) — so this is really a lifetime cap, not a live cap.
+    DonorStreamCount(Address),
 }
 
 #[contracterror]
@@ -63,11 +69,20 @@ pub enum Error {
     /// leave its type's range. Returned instead of letting the release
     /// profile's overflow checks panic and abort the transaction.
     ArithmeticOverflow = 9,
+    /// The donor already has `max_streams_per_donor` streams. Raised by
+    /// `create_stream` before the deposit is pulled. See issue #94.
+    StreamLimitExceeded = 10,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
 /// an unreasonable cut of donations.
 const MAX_FEE_BPS: u32 = 1_000;
+
+/// Default per-donor stream cap applied when `set_max_streams_per_donor`
+/// has not been called. Chosen so an ordinary donor can open hundreds of
+/// streams across many NGOs, but a flood attack hits the ceiling long
+/// before it can bloat persistent storage. See issue #94.
+const DEFAULT_MAX_STREAMS_PER_DONOR: u64 = 100;
 
 /// Approximate ledgers per day at a 5-second close time. Used to express
 /// storage TTLs (which the network counts in ledgers, not wall time) in
@@ -707,6 +722,22 @@ impl DonationVault {
             return Err(Error::InvalidAmount);
         }
 
+        // Per-donor stream cap (issue #94). Read before the token transfer
+        // so a rejected donor is rejected without moving funds.
+        let max_streams: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxStreamsPerDonor)
+            .unwrap_or(DEFAULT_MAX_STREAMS_PER_DONOR);
+        let donor_streams: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DonorStreamCount(donor.clone()))
+            .unwrap_or(0);
+        if donor_streams >= max_streams {
+            return Err(Error::StreamLimitExceeded);
+        }
+
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&donor, env.current_contract_address(), &deposit);
 
@@ -737,6 +768,17 @@ impl DonationVault {
         env.storage()
             .instance()
             .set(&DataKey::NextStreamId, &next_stream_id);
+
+        let donor_key = DataKey::DonorStreamCount(donor.clone());
+        let new_count = donor_streams
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage().persistent().set(&donor_key, &new_count);
+        env.storage().persistent().extend_ttl(
+            &donor_key,
+            STREAM_LIFETIME_THRESHOLD,
+            STREAM_BUMP_AMOUNT,
+        );
 
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
@@ -1014,6 +1056,58 @@ impl DonationVault {
             .publish((symbol_short!("ratemod"), stream_id), new_rate);
 
         Ok(())
+    }
+
+    /// Sets the per-donor stream cap. Admin-gated. Applies only to streams
+    /// created after the call — lowering the cap does not affect a donor
+    /// who already has more than the new limit.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// client.set_max_streams_per_donor(&5);
+    /// assert_eq!(client.max_streams_per_donor(), 5);
+    /// ```
+    pub fn set_max_streams_per_donor(env: Env, limit: u64) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxStreamsPerDonor, &limit);
+        extend_instance_ttl(&env);
+        env.events()
+            .publish((symbol_short!("maxstrm"),), limit);
+        Ok(())
+    }
+
+    /// Reads back the configured per-donor stream cap, or the default if
+    /// `set_max_streams_per_donor` has never been called.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// assert_eq!(client.max_streams_per_donor(), 100);
+    /// ```
+    pub fn max_streams_per_donor(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxStreamsPerDonor)
+            .unwrap_or(DEFAULT_MAX_STREAMS_PER_DONOR)
     }
 }
 

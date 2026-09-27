@@ -1053,3 +1053,103 @@ fn accept_admin_requires_pending_admin_auth() {
     // The proposed address, not the outgoing admin, has to accept.
     assert_auth_required_from(&s, &new_admin, "accept_admin");
 }
+
+
+// =============================================================================
+// Per-donor stream limit (issue #94)
+// =============================================================================
+
+#[test]
+fn max_streams_per_donor_defaults_to_100() {
+    let s = setup();
+    assert_eq!(s.client.max_streams_per_donor(), 100);
+}
+
+#[test]
+fn admin_can_set_the_per_donor_cap() {
+    let s = setup();
+    s.client.set_max_streams_per_donor(&5);
+    assert_eq!(s.client.max_streams_per_donor(), 5);
+}
+
+#[test]
+fn non_admin_cannot_set_the_per_donor_cap() {
+    let s = setup();
+    s.env.mock_auths(&[]);
+    let result = s.client.try_set_max_streams_per_donor(&5);
+    assert!(result.is_err());
+}
+
+#[test]
+fn create_stream_rejects_the_101st_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+
+    // Fill the default cap.
+    for _ in 0..100 {
+        s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    }
+
+    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert!(result.is_err());
+}
+
+#[test]
+fn raising_the_cap_lets_the_next_stream_through() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+    s.client.set_max_streams_per_donor(&1);
+
+    s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // At the cap, next call fails.
+    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert!(result.is_err());
+
+    // Raise the cap. Next call succeeds.
+    s.client.set_max_streams_per_donor(&2);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).donor, s.donor);
+}
+
+#[test]
+fn lowering_the_cap_does_not_retroactively_affect_existing_streams() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+    s.client.set_max_streams_per_donor(&5);
+
+    for _ in 0..3 {
+        s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    }
+
+    // Drop the cap below the current count.
+    s.client.set_max_streams_per_donor(&1);
+
+    // New streams are rejected.
+    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert!(result.is_err());
+
+    // Existing streams are untouched and still withdrawable.
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+    let withdrawn = s.client.withdraw(&0);
+    assert_eq!(withdrawn, 500);
+}
+
+#[test]
+fn separate_donors_have_separate_counters() {
+    let s = setup();
+    s.client.set_max_streams_per_donor(&1);
+
+    let donor_b = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &1_000);
+    s.token_admin.mint(&donor_b, &1_000);
+
+    s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    // A different donor is unaffected by donor A's cap.
+    let donor_b_stream = s.client.create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&donor_b_stream).donor, donor_b);
+
+    // But donor_b is now at its own cap.
+    let result = s.client.try_create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
+    assert!(result.is_err());
+}
