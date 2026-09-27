@@ -587,6 +587,22 @@ fn set_fee_bps_rejects_over_cap() {
 }
 
 #[test]
+fn set_fee_bps_boundary_exact_max_succeeds() {
+    let s = setup();
+
+    // Exactly 1 000 bps (10%) is the maximum allowed fee — it must be
+    // accepted and stored faithfully.
+    s.client.set_fee_bps(&1_000);
+    assert_eq!(s.client.fee_bps(), 1_000);
+
+    // One basis point above the cap must still be rejected with FeeTooHigh
+    // specifically, not just any error, so an off-by-one in the guard
+    // can't hide behind a different error path.
+    let result = s.client.try_set_fee_bps(&1_001);
+    assert_eq!(result, Err(Ok(Error::FeeTooHigh)));
+}
+
+#[test]
 #[should_panic]
 fn withdraw_fails_for_non_ngo_caller() {
     let s = setup();
