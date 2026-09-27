@@ -86,6 +86,16 @@ stellar contract invoke \
   --network "$NETWORK" \
   -- init --admin "$ADMIN_ADDRESS"
 
+# deploy-mainnet.sh records its deployment under a "mainnet" key in this same
+# file; rewriting the file must not lose it, so carry it over if present.
+MAINNET_ENTRY=""
+if [ -f "$DEPLOYMENTS_FILE" ] && command -v node >/dev/null 2>&1; then
+  MAINNET_ENTRY=$(DEPLOYMENTS_FILE="$DEPLOYMENTS_FILE" node -e '
+    const data = JSON.parse(require("fs").readFileSync(process.env.DEPLOYMENTS_FILE, "utf8"));
+    if (data.mainnet) process.stdout.write(JSON.stringify(data.mainnet));
+  ')
+fi
+
 cat > "$DEPLOYMENTS_FILE" <<EOF
 {
   "network": "$NETWORK",
@@ -97,5 +107,14 @@ cat > "$DEPLOYMENTS_FILE" <<EOF
   }
 }
 EOF
+
+if [ -n "$MAINNET_ENTRY" ]; then
+  DEPLOYMENTS_FILE="$DEPLOYMENTS_FILE" MAINNET_ENTRY="$MAINNET_ENTRY" node -e '
+    const fs = require("fs");
+    const data = JSON.parse(fs.readFileSync(process.env.DEPLOYMENTS_FILE, "utf8"));
+    data.mainnet = JSON.parse(process.env.MAINNET_ENTRY);
+    fs.writeFileSync(process.env.DEPLOYMENTS_FILE, JSON.stringify(data, null, 2) + "\n");
+  '
+fi
 
 echo "Wrote $DEPLOYMENTS_FILE"
