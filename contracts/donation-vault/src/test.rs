@@ -321,7 +321,7 @@ fn create_stream_rejects_non_positive_amounts() {
 #[test]
 fn create_stream_errors_instead_of_defaulting_when_counter_is_missing() {
     let s = setup();
-    s.token_admin.mint(&s.donor, &1_000);
+    assert_eq!(s.client.min_deposit(), 0);
 
     // `init` always sets NextStreamId, so this shouldn't happen in
     // practice — but nothing enforces that, and if the counter were ever
@@ -380,6 +380,13 @@ fn propose_then_accept_admin_transfers_control() {
 fn accept_admin_without_proposal_fails() {
     let s = setup();
     let result = s.client.try_accept_admin();
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+}
+
+#[test]
+fn cancel_admin_proposal_without_proposal_fails() {
+    let s = setup();
+    let result = s.client.try_cancel_admin_proposal();
     assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
 }
 
