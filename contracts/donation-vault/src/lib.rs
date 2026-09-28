@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![no_std]
 // soroban-sdk 27 deprecates Events::publish in favour of the
 // #[contractevent] macro. Migrating is not a lint cleanup: #[contractevent]

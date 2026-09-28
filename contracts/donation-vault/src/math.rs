@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /// Computes how much of `balance` has unlocked given a constant per-second
 /// `rate` sustained over `elapsed` seconds, capped so it can never exceed
 /// what's actually left in the stream.
