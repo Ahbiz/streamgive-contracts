@@ -391,6 +391,13 @@ fn accept_admin_without_proposal_fails() {
 }
 
 #[test]
+fn cancel_admin_proposal_without_proposal_fails() {
+    let s = setup();
+    let result = s.client.try_cancel_admin_proposal();
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+}
+
+#[test]
 #[should_panic]
 fn old_admin_loses_admin_gated_access_after_transfer() {
     let s = setup();
