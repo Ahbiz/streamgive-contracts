@@ -622,6 +622,36 @@ impl DonationVault {
         env.storage().instance().get(&DataKey::Treasury)
     }
 
+    /// Removes the configured treasury so protocol fees are no longer collected.
+    /// After this call `treasury()` returns `None` and `pay_ngo` sends the full
+    /// payout directly to the NGO, the same as if a treasury had never been set.
+    /// Admin-gated.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// let treasury = Address::generate(&env);
+    /// client.set_treasury(&treasury);
+    /// assert_eq!(client.treasury(), Some(treasury));
+    ///
+    /// client.clear_treasury();
+    /// assert_eq!(client.treasury(), None);
+    /// ```
+    pub fn clear_treasury(env: Env) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage().instance().remove(&DataKey::Treasury);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
     /// Sets the protocol fee, in basis points, taken out of accrued payouts
     /// to the NGO. Admin-gated, capped at `MAX_FEE_BPS`. Has no effect
     /// unless a treasury is also set.
