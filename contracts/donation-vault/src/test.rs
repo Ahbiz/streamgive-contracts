@@ -587,6 +587,36 @@ fn withdraw_with_no_treasury_takes_no_fee() {
 }
 
 #[test]
+fn clear_treasury_stops_fee_collection_on_subsequent_withdraws() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5%
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // First withdraw while treasury is active — fee is taken.
+    s.env.ledger().with_mut(|l| l.timestamp += 20); // 200 accrues
+    s.client.withdraw(&stream_id);
+    assert_eq!(s.token.balance(&treasury), 10); // 5% of 200
+    assert_eq!(s.token.balance(&s.ngo), 190);
+
+    // Admin clears the treasury; storage key is gone.
+    s.client.clear_treasury();
+    assert_eq!(s.client.treasury(), None);
+
+    // Second withdraw — full amount goes to the NGO, nothing to the old treasury.
+    s.env.ledger().with_mut(|l| l.timestamp += 20); // 200 more accrues
+    s.client.withdraw(&stream_id);
+    assert_eq!(s.token.balance(&s.ngo), 390); // 190 + 200, no fee
+    assert_eq!(s.token.balance(&treasury), 10); // unchanged
+}
+
+#[test]
 fn withdraw_splits_protocol_fee_to_treasury() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -1304,6 +1334,9 @@ fn admin_entry_points_require_admin_auth() {
 
     s.client.set_treasury(&Address::generate(&s.env));
     assert_auth_required_from(&s, &admin, "set_treasury");
+
+    s.client.clear_treasury();
+    assert_auth_required_from(&s, &admin, "clear_treasury");
 
     s.client.set_fee_bps(&100);
     assert_auth_required_from(&s, &admin, "set_fee_bps");
