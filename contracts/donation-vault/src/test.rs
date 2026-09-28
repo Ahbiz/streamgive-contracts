@@ -193,6 +193,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     let stream = s.client.get_stream(&stream_id);
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
+    assert!(stream.cancelled);
 }
 
 #[test]
@@ -755,6 +756,9 @@ fn withdraw_and_cancel_on_fully_drained_stream_are_no_ops() {
     let stream = s.client.get_stream(&stream_id);
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.withdrawn, 1_000);
+    // Drained by withdrawal, not cancelled — the rate is still live.
+    assert!(!stream.cancelled);
+    assert_eq!(stream.rate, 10);
 
     // More time passes, but there's nothing left to accrue.
     s.env.ledger().with_mut(|l| l.timestamp += 50);
@@ -762,7 +766,9 @@ fn withdraw_and_cancel_on_fully_drained_stream_are_no_ops() {
     let result = s.client.try_withdraw(&stream_id);
     assert_eq!(result, Err(Ok(Error::NothingToWithdraw)));
 
-    // Cancelling a drained stream settles and refunds nothing.
+    // Cancelling a drained stream settles and refunds nothing, but it does
+    // flip `cancelled` — the one bit that distinguishes it from a stream
+    // that merely ran dry.
     let refund = s.client.cancel_stream(&stream_id);
     assert_eq!(refund, 0);
     assert_eq!(s.token.balance(&s.ngo), 1_000);
@@ -772,6 +778,7 @@ fn withdraw_and_cancel_on_fully_drained_stream_are_no_ops() {
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 1_000);
+    assert!(stream.cancelled);
 }
 
 #[test]
@@ -794,6 +801,7 @@ fn cancel_stream_twice_is_harmless() {
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 500);
+    assert!(stream.cancelled);
 
     // Cancelling again settles zero (rate and balance are already zero) and
     // refunds zero, leaving balances and stream state unchanged.
@@ -808,6 +816,7 @@ fn cancel_stream_twice_is_harmless() {
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 500);
+    assert!(stream.cancelled);
 }
 
 #[test]
@@ -929,6 +938,7 @@ fn create_stream_stores_every_field() {
             withdrawn: 0,
             created_at: 12_345,
             last_update: 12_345,
+            cancelled: false,
         }
     );
 }
