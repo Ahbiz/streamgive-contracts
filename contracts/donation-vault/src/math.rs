@@ -117,6 +117,121 @@ mod test {
         }
     }
 
+    /// Randomised counterpart to the grid test above: the same invariants
+    /// (non-negative, capped, monotonic), but over inputs drawn from the whole
+    /// i128/u64 range, biased towards the zero and near-`MAX` edges the grid
+    /// only samples at a few fixed points.
+    mod fuzz {
+        use super::accrued;
+        use proptest::prelude::*;
+
+        fn any_rate() -> impl Strategy<Value = i128> {
+            prop_oneof![
+                any::<i128>(),
+                Just(0i128),
+                Just(i128::MAX),
+                0i128..=1_000,
+                (i128::MAX - 1_000)..=i128::MAX,
+                i128::MIN..=-1,
+            ]
+        }
+
+        fn any_balance() -> impl Strategy<Value = i128> {
+            any_rate()
+        }
+
+        fn any_elapsed() -> impl Strategy<Value = u64> {
+            prop_oneof![
+                any::<u64>(),
+                Just(0u64),
+                Just(u64::MAX),
+                0u64..=1_000,
+                (u64::MAX - 1_000)..=u64::MAX,
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+            /// Never negative, never more than what's left in the stream, and
+            /// never panics — for every input, including overflowing ones.
+            #[test]
+            fn non_negative_and_capped_by_balance(
+                rate in any_rate(),
+                elapsed in any_elapsed(),
+                balance in any_balance(),
+            ) {
+                let a = accrued(rate, elapsed, balance);
+                prop_assert!(a >= 0, "negative accrual: {a}");
+                prop_assert!(a <= balance.max(0), "accrual {a} exceeds balance {balance}");
+            }
+
+            /// More elapsed time never accrues less, even once capped.
+            #[test]
+            fn monotonic_in_elapsed(
+                rate in any_rate(),
+                e1 in any_elapsed(),
+                e2 in any_elapsed(),
+                balance in any_balance(),
+            ) {
+                let (lo, hi) = if e1 <= e2 { (e1, e2) } else { (e2, e1) };
+                prop_assert!(accrued(rate, lo, balance) <= accrued(rate, hi, balance));
+            }
+
+            /// A higher rate never accrues less for the same elapsed and balance.
+            #[test]
+            fn monotonic_in_rate(
+                r1 in any_rate(),
+                r2 in any_rate(),
+                elapsed in any_elapsed(),
+                balance in any_balance(),
+            ) {
+                let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+                prop_assert!(accrued(lo, elapsed, balance) <= accrued(hi, elapsed, balance));
+            }
+
+            /// A larger balance never lowers the accrual: the cap only loosens.
+            #[test]
+            fn monotonic_in_balance(
+                rate in any_rate(),
+                elapsed in any_elapsed(),
+                b1 in any_balance(),
+                b2 in any_balance(),
+            ) {
+                let (lo, hi) = if b1 <= b2 { (b1, b2) } else { (b2, b1) };
+                prop_assert!(accrued(rate, elapsed, lo) <= accrued(rate, elapsed, hi));
+            }
+
+            /// Non-positive rate or balance, or zero elapsed, accrues nothing.
+            #[test]
+            fn degenerate_inputs_accrue_nothing(
+                rate in any_rate(),
+                elapsed in any_elapsed(),
+                balance in any_balance(),
+            ) {
+                if rate <= 0 || balance <= 0 || elapsed == 0 {
+                    prop_assert_eq!(accrued(rate, elapsed, balance), 0);
+                }
+            }
+
+            /// Whenever `rate * elapsed` fits in i128, the result is exactly
+            /// `min(rate * elapsed, balance)`; when it doesn't, it saturates
+            /// to `balance`.
+            #[test]
+            fn matches_exact_arithmetic(
+                rate in 1i128..=i128::MAX,
+                elapsed in 1u64..=u64::MAX,
+                balance in 1i128..=i128::MAX,
+            ) {
+                let expected = match rate.checked_mul(elapsed as i128) {
+                    Some(unlocked) => unlocked.min(balance),
+                    None => balance,
+                };
+                prop_assert_eq!(accrued(rate, elapsed, balance), expected);
+            }
+        }
+    }
+
     #[test]
     fn monotonic_in_rate_for_fixed_elapsed_and_balance() {
         let rates = [0i128, 1, 5, 50, 500, i128::MAX];
