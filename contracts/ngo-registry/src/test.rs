@@ -393,3 +393,71 @@ fn touch_ngo_bumps_instance_and_ngo_ttl() {
 
     assert_ttls_bumped(&env, &client, &owner);
 }
+
+// --- Event assertion tests (issue #62) ---
+
+#[test]
+fn register_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+
+    client.register(&owner, &name);
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("register"), owner).into_val(&env),
+                name.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn approve_ngo_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.approve_ngo(&owner);
+
+    // Events are cleared per top-level call; only the approved event is visible.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn revoke_ngo_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+
+    client.revoke_ngo(&owner);
+
+    // Events are cleared per top-level call; only the revoked event is visible.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("revoked"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
