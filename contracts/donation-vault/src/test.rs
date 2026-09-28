@@ -1470,3 +1470,79 @@ fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
     assert_eq!(s.token.balance(&s.ngo), net);
     assert_eq!(s.token.balance(&treasury), fee);
 }
+
+// ── Issue #64 ─────────────────────────────────────────────────────────────────
+// Every admin-gated entry point must fail closed with Error::NotInitialized
+// when called before init, rather than silently defaulting (e.g. paused()
+// reads a missing key as false, which would leave a pre-init vault looking
+// operational).
+
+#[test]
+fn admin_functions_before_init_return_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DonationVault, ());
+    let client = DonationVaultClient::new(&env, &contract_id);
+
+    let treasury = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    // Every entry point that reaches for the admin through require_admin().
+    assert_eq!(
+        client.try_pause(),
+        Err(Ok(Error::NotInitialized)),
+        "pause() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_unpause(),
+        Err(Ok(Error::NotInitialized)),
+        "unpause() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_set_treasury(&treasury),
+        Err(Ok(Error::NotInitialized)),
+        "set_treasury() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_clear_treasury(),
+        Err(Ok(Error::NotInitialized)),
+        "clear_treasury() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_set_fee_bps(&100),
+        Err(Ok(Error::NotInitialized)),
+        "set_fee_bps() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_set_min_deposit(&1),
+        Err(Ok(Error::NotInitialized)),
+        "set_min_deposit() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_propose_admin(&new_admin),
+        Err(Ok(Error::NotInitialized)),
+        "propose_admin() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_cancel_admin_proposal(),
+        Err(Ok(Error::NotInitialized)),
+        "cancel_admin_proposal() must return NotInitialized before init"
+    );
+
+    // The admin reader reports the same rather than defaulting to a
+    // zero address.
+    assert_eq!(
+        client.try_admin(),
+        Err(Ok(Error::NotInitialized)),
+        "admin() must return NotInitialized before init"
+    );
+
+    // accept_admin doesn't go through require_admin — it reads the pending
+    // proposal directly, so before init there is nothing to accept. That's
+    // NoPendingAdmin rather than NotInitialized, but it still fails closed.
+    assert_eq!(
+        client.try_accept_admin(),
+        Err(Ok(Error::NoPendingAdmin)),
+        "accept_admin() must fail closed before init"
+    );
+}
