@@ -157,6 +157,21 @@ fn record_payout(stream: &mut Stream, amount: i128) -> Result<(), Error> {
     Ok(())
 }
 
+/// Returns the protocol fee that would be taken on `amount`, using the same
+/// logic as `pay_ngo`. Zero when no treasury is configured, regardless of
+/// `fee_bps` — there's nowhere to send a fee without a destination address.
+/// Rounds toward zero (the NGO never loses a unit to rounding).
+fn compute_fee(env: &Env, amount: i128) -> i128 {
+    let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+    match treasury {
+        Some(_) => {
+            let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+            (amount.saturating_mul(fee_bps as i128) / 10_000).min(amount)
+        }
+        None => 0,
+    }
+}
+
 /// Pays `amount` out to the NGO, skimming a protocol fee to the treasury
 /// first if one is configured. With no treasury set, the full amount goes
 /// to the NGO regardless of `fee_bps` — there's nowhere to send a fee.
@@ -165,20 +180,14 @@ fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128)
         return;
     }
 
-    let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
-    let fee = match &treasury {
-        Some(_) => {
-            let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
-            (amount.saturating_mul(fee_bps as i128) / 10_000).min(amount)
-        }
-        None => 0,
-    };
+    let fee = compute_fee(env, amount);
     let net = amount - fee;
 
     if net > 0 {
         token_client.transfer(&env.current_contract_address(), ngo, &net);
     }
     if fee > 0 {
+        let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
         if let Some(treasury) = treasury {
             token_client.transfer(&env.current_contract_address(), &treasury, &fee);
         }
@@ -485,6 +494,57 @@ impl DonationVault {
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(stream.last_update);
         Ok(math::accrued(stream.rate, elapsed, stream.balance))
+    }
+
+    /// Read-only view of the net amount the NGO would actually receive and the
+    /// fee that would be taken if `withdraw` were called right now.
+    ///
+    /// Unlike `pending_accrual`, which returns the gross accrued amount, this
+    /// accounts for any configured treasury fee, so a UI can show the correct
+    /// "you will receive X" figure rather than overstating it.
+    ///
+    /// Never mutates storage or moves funds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &1_000);
+    /// let treasury = Address::generate(&env);
+    /// client.set_treasury(&treasury);
+    /// client.set_fee_bps(&500); // 5%
+    ///
+    /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+    ///
+    /// let (net, fee) = client.pending_payout(&stream_id);
+    /// assert_eq!(fee, 25);   // 5% of 500
+    /// assert_eq!(net, 475);  // 500 - 25
+    /// ```
+    pub fn pending_payout(env: Env, stream_id: u64) -> Result<(i128, i128), Error> {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(stream.last_update);
+        let gross = math::accrued(stream.rate, elapsed, stream.balance);
+        let fee = compute_fee(&env, gross);
+        Ok((gross - fee, fee))
     }
 
     /// Bumps a stream's persistent-storage TTL without touching its state.

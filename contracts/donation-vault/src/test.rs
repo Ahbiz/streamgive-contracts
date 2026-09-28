@@ -31,32 +31,6 @@ impl PartialEq<(Vec<Val>, Val)> for LastEvent {
     }
 }
 
-use soroban_sdk::TryFromVal as _;
-
-struct LastEvent(Env, soroban_sdk::xdr::ContractEvent);
-
-impl core::fmt::Debug for LastEvent {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:?}", self.1)
-    }
-}
-
-impl PartialEq<(Vec<Val>, Val)> for LastEvent {
-    fn eq(&self, other: &(Vec<Val>, Val)) -> bool {
-        let (topics, data) = other;
-        let data_xdr = match soroban_sdk::xdr::ScVal::try_from_val(&self.0, data) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        match &self.1.body {
-            soroban_sdk::xdr::ContractEventBody::V0(v0) => {
-                let topics_xdr: soroban_sdk::xdr::ScVec = topics.clone().into();
-                v0.topics == *topics_xdr && v0.data == data_xdr
-            }
-        }
-    }
-}
-
 /// The topics and data of the most recently published event, regardless of
 /// which contract emitted it — vault entry points always publish their own
 /// event last, after any token transfer, so this is the vault's event.
@@ -1359,4 +1333,80 @@ fn accept_admin_requires_pending_admin_auth() {
 
     // The proposed address, not the outgoing admin, has to accept.
     assert_auth_required_from(&s, &new_admin, "accept_admin");
+}
+
+#[test]
+fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    s.client.set_fee_bps(&500); // 5% configured, but no treasury
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0);   // no treasury → no fee, regardless of fee_bps
+    assert_eq!(net, 500); // full accrual goes to the NGO
+
+    // Read-only: nothing moved.
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 1_000);
+    assert_eq!(stream.withdrawn, 0);
+}
+
+#[test]
+fn pending_payout_with_treasury_and_zero_bps_returns_full_gross_and_zero_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    // fee_bps defaults to 0 — a treasury exists but takes nothing
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0);   // 0 bps → zero fee even with a treasury set
+    assert_eq!(net, 500);
+
+    // Read-only: nothing moved.
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    assert_eq!(s.token.balance(&treasury), 0);
+}
+
+#[test]
+fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5%
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 25);  // 5% of 500
+    assert_eq!(net, 475); // 500 - 25
+
+    // Read-only: nothing moved yet.
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    assert_eq!(s.token.balance(&treasury), 0);
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 1_000);
+    assert_eq!(stream.withdrawn, 0);
+
+    // The values must match exactly what withdraw actually distributes.
+    s.client.withdraw(&stream_id);
+    assert_eq!(s.token.balance(&s.ngo), net);
+    assert_eq!(s.token.balance(&treasury), fee);
 }
