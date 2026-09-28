@@ -32,6 +32,7 @@ counts below assume a 5-second average ledger close time
 | `Paused` | Instance | 30d / 29d | Emergency-brake flag checked by `require_not_paused`. |
 | `Treasury` | Instance | 30d / 29d | Address that receives the protocol fee cut on withdrawal. |
 | `FeeBps` | Instance | 30d / 29d | Protocol fee, in basis points, capped at `MAX_FEE_BPS` (1,000 / 10%). |
+| `CancelGraceLedgers` | Instance | 30d / 29d | Additional ledgers to retain cancelled stream records for indexing. |
 | `Stream(u64)` | Persistent | 90d / 89d | One donor→NGO stream record, keyed by stream id. Extended on every `create_stream`, `withdraw`, `top_up`, `cancel_stream`, or rate change touching that stream. |
 
 All instance keys share one TTL (bumped to 30 days, refreshed once it
@@ -40,6 +41,11 @@ called on every state-changing entry point. Each `Stream(u64)` entry gets
 its own 90-day TTL via `extend_stream_ttl`, called whenever that specific
 stream is touched — an untouched stream can still expire independently of
 the instance and of other streams.
+
+On cancellation, the stream TTL is bumped to the normal 90-day retention
+period plus the configured `cancel_grace_ledgers`. This gives indexers a
+configurable window to observe the cancellation before the record becomes
+eligible for archival.
 
 ## `ngo-registry`
 
