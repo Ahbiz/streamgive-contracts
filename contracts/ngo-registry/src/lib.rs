@@ -39,6 +39,8 @@ pub enum Error {
     NotRegistered = 4,
     /// The NGO has already been approved, so its name is locked.
     AlreadyVerified = 5,
+    /// `register` was called with a zero-length name.
+    InvalidName = 6,
 }
 
 /// Approximate ledgers per day at a 5-second close time. Used to express
@@ -156,6 +158,10 @@ impl NgoRegistry {
     /// ```
     pub fn register(env: Env, owner: Address, name: String) -> Result<(), Error> {
         owner.require_auth();
+
+        if name.is_empty() {
+            return Err(Error::InvalidName);
+        }
 
         let key = DataKey::Ngo(owner.clone());
         if env.storage().persistent().has(&key) {

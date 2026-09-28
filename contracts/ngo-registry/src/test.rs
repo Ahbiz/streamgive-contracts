@@ -61,6 +61,18 @@ fn double_register_fails() {
 }
 
 #[test]
+fn register_rejects_empty_name() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+
+    let result = client.try_register(&owner, &String::from_str(&env, ""));
+    assert_eq!(result, Err(Ok(Error::InvalidName)));
+
+    let get_result = client.try_get_ngo(&owner);
+    assert_eq!(get_result, Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
 fn ngo_count_initially_zero() {
     let (_env, client, _admin) = setup();
     assert_eq!(client.ngo_count(), 0);

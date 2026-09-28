@@ -132,6 +132,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
 | 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
 | 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved; the approved name is locked. |
+| 6    | `InvalidName`         | `register` was called with a zero-length name.                   |
 
 ## Status
 
