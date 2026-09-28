@@ -61,6 +61,18 @@ fn double_register_fails() {
 }
 
 #[test]
+fn register_rejects_empty_name() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+
+    let result = client.try_register(&owner, &String::from_str(&env, ""));
+    assert_eq!(result, Err(Ok(Error::InvalidName)));
+
+    let get_result = client.try_get_ngo(&owner);
+    assert_eq!(get_result, Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
 fn ngo_count_initially_zero() {
     let (_env, client, _admin) = setup();
     assert_eq!(client.ngo_count(), 0);
@@ -125,6 +137,20 @@ fn approve_ngo_marks_verified() {
 }
 
 #[test]
+fn approve_ngo_twice_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+    client.register(&owner, &name);
+
+    client.approve_ngo(&owner);
+
+    let result = client.try_approve_ngo(&owner);
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    assert!(client.get_ngo(&owner).verified);
+}
+
+#[test]
 fn approve_unregistered_ngo_fails() {
     let (env, client, _admin) = setup();
     let random = Address::generate(&env);
@@ -147,6 +173,18 @@ fn revoke_ngo_clears_verified_status() {
 
     let ngo = client.get_ngo(&owner);
     assert!(!ngo.verified);
+}
+
+#[test]
+fn revoke_unverified_ngo_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+    client.register(&owner, &name);
+
+    let result = client.try_revoke_ngo(&owner);
+    assert_eq!(result, Err(Ok(Error::NotVerified)));
+    assert!(!client.get_ngo(&owner).verified);
 }
 
 #[test]

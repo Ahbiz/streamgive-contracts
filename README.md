@@ -122,6 +122,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
 | 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
 | 10   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`, which would stream the donor's own deposit back to them. |
+| 11   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
 
 ### `ngo-registry`
 
@@ -131,7 +132,9 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.  |
 | 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
 | 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
-| 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved; the approved name is locked. |
+| 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
+| 6    | `InvalidName`         | `register` was called with a zero-length name.                   |
+| 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
 
 ## Status
 

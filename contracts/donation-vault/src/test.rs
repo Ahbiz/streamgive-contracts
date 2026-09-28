@@ -193,6 +193,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     let stream = s.client.get_stream(&stream_id);
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
+    assert!(stream.cancelled);
 }
 
 #[test]
@@ -755,6 +756,9 @@ fn withdraw_and_cancel_on_fully_drained_stream_are_no_ops() {
     let stream = s.client.get_stream(&stream_id);
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.withdrawn, 1_000);
+    // Drained by withdrawal, not cancelled — the rate is still live.
+    assert!(!stream.cancelled);
+    assert_eq!(stream.rate, 10);
 
     // More time passes, but there's nothing left to accrue.
     s.env.ledger().with_mut(|l| l.timestamp += 50);
@@ -762,7 +766,9 @@ fn withdraw_and_cancel_on_fully_drained_stream_are_no_ops() {
     let result = s.client.try_withdraw(&stream_id);
     assert_eq!(result, Err(Ok(Error::NothingToWithdraw)));
 
-    // Cancelling a drained stream settles and refunds nothing.
+    // Cancelling a drained stream settles and refunds nothing, but it does
+    // flip `cancelled` — the one bit that distinguishes it from a stream
+    // that merely ran dry.
     let refund = s.client.cancel_stream(&stream_id);
     assert_eq!(refund, 0);
     assert_eq!(s.token.balance(&s.ngo), 1_000);
@@ -772,6 +778,7 @@ fn withdraw_and_cancel_on_fully_drained_stream_are_no_ops() {
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 1_000);
+    assert!(stream.cancelled);
 }
 
 #[test]
@@ -794,6 +801,7 @@ fn cancel_stream_twice_is_harmless() {
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 500);
+    assert!(stream.cancelled);
 
     // Cancelling again settles zero (rate and balance are already zero) and
     // refunds zero, leaving balances and stream state unchanged.
@@ -808,6 +816,7 @@ fn cancel_stream_twice_is_harmless() {
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 500);
+    assert!(stream.cancelled);
 }
 
 #[test]
@@ -831,6 +840,24 @@ fn modify_rate_rejects_non_positive_rate() {
     assert_eq!(stream.rate, 10);
     assert_eq!(stream.balance, 1_000);
     assert_eq!(stream.withdrawn, 0);
+}
+
+#[test]
+fn modify_rate_on_cancelled_stream_fails() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    let result = s.client.try_modify_rate(&stream_id, &20);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+
+    // The rejected call leaves the cancelled stream's rate at zero — it
+    // must not be revivable via modify_rate.
+    assert_eq!(s.client.get_stream(&stream_id).rate, 0);
 }
 
 #[test]
@@ -874,6 +901,25 @@ fn top_up_rejects_non_positive_amount() {
     assert_eq!(stream.withdrawn, 0);
     assert_eq!(s.token.balance(&s.donor), 500);
     assert_eq!(s.token.balance(&s.ngo), 0);
+}
+
+#[test]
+fn top_up_on_cancelled_stream_fails() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    let result = s.client.try_top_up(&stream_id, &500);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+
+    // The rejected call moves no tokens: the donor still holds the full
+    // 1_000 refunded by cancel_stream (no time passed, so nothing accrued).
+    assert_eq!(s.token.balance(&s.donor), 2_000);
+    assert_eq!(s.token.balance(&s.client.address), 0);
 }
 
 #[test]
@@ -929,6 +975,7 @@ fn create_stream_stores_every_field() {
             withdrawn: 0,
             created_at: 12_345,
             last_update: 12_345,
+            cancelled: false,
         }
     );
 }

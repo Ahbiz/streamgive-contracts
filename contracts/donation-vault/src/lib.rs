@@ -33,6 +33,10 @@ pub struct Stream {
     pub withdrawn: i128,
     pub created_at: u64,
     pub last_update: u64,
+    /// Set once by `cancel_stream`, never unset. Distinguishes a cancelled
+    /// stream (`rate == 0`, `balance == 0`) from one that simply ran dry
+    /// and was withdrawn in full (`balance == 0` but `rate` unchanged).
+    pub cancelled: bool,
 }
 
 #[contracttype]
@@ -68,6 +72,12 @@ pub enum Error {
     /// nets to zero still counts as a committed donation in the indexer and
     /// on impact pages, which is a way to inflate those totals for free.
     SelfStream = 10,
+    /// `top_up` or `modify_rate` was called on a stream that `cancel_stream`
+    /// has already closed out. A cancelled stream's rate and balance are
+    /// zeroed for good; topping it up would just sit inert, and changing
+    /// its rate would quietly revive a stream the backend already treats
+    /// as terminal.
+    StreamCancelled = 11,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -389,6 +399,12 @@ impl DonationVault {
     /// let stream = client.get_stream(&stream_id);
     /// assert_eq!(stream.balance, 1_000);
     /// assert_eq!(stream.rate, 10);
+    /// assert!(!stream.cancelled);
+    ///
+    /// // Once cancelled, `cancelled` stays true even though a drained
+    /// // (fully withdrawn) stream would also show `rate == 0 && balance == 0`.
+    /// client.cancel_stream(&stream_id);
+    /// assert!(client.get_stream(&stream_id).cancelled);
     /// ```
     pub fn get_stream(env: Env, stream_id: u64) -> Result<Stream, Error> {
         env.storage()
@@ -744,6 +760,7 @@ impl DonationVault {
             withdrawn: 0,
             created_at: now,
             last_update: now,
+            cancelled: false,
         };
 
         env.storage()
@@ -859,6 +876,7 @@ impl DonationVault {
     /// let refund = client.cancel_stream(&stream_id);
     /// assert_eq!(refund, 800);
     /// assert_eq!(client.get_stream(&stream_id).balance, 0);
+    /// assert!(client.get_stream(&stream_id).cancelled);
     /// ```
     pub fn cancel_stream(env: Env, stream_id: u64) -> Result<i128, Error> {
         let key = DataKey::Stream(stream_id);
@@ -888,6 +906,7 @@ impl DonationVault {
 
         stream.balance = 0;
         stream.rate = 0;
+        stream.cancelled = true;
         stream.last_update = now;
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
@@ -901,7 +920,9 @@ impl DonationVault {
 
     /// Adds more funds to an existing stream. Donor-auth-gated. Settles
     /// whatever has already accrued to the NGO first, so the top-up only
-    /// ever affects accrual going forward.
+    /// ever affects accrual going forward. Fails with
+    /// `Error::StreamCancelled` if `cancel_stream` has already closed the
+    /// stream out.
     ///
     /// # Examples
     ///
@@ -942,6 +963,10 @@ impl DonationVault {
 
         stream.donor.require_auth();
 
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
+
         let token_client = token::Client::new(&env, &stream.token);
 
         let now = env.ledger().timestamp();
@@ -971,7 +996,9 @@ impl DonationVault {
 
     /// Changes the per-second accrual rate on an existing stream. Donor-auth-gated.
     /// Settles whatever has already accrued at the old rate first, so the new
-    /// rate only ever applies going forward — never retroactively.
+    /// rate only ever applies going forward — never retroactively. Fails
+    /// with `Error::StreamCancelled` if `cancel_stream` has already closed
+    /// the stream out — otherwise this would quietly revive it.
     ///
     /// # Examples
     ///
@@ -1011,6 +1038,10 @@ impl DonationVault {
             .ok_or(Error::StreamNotFound)?;
 
         stream.donor.require_auth();
+
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
 
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(stream.last_update);

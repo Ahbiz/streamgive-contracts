@@ -39,6 +39,10 @@ pub enum Error {
     NotRegistered = 4,
     /// The NGO has already been approved, so its name is locked.
     AlreadyVerified = 5,
+    /// `register` was called with a zero-length name.
+    InvalidName = 6,
+    /// `revoke_ngo` was called on an NGO that isn't currently verified.
+    NotVerified = 7,
 }
 
 /// Approximate ledgers per day at a 5-second close time. Used to express
@@ -156,6 +160,10 @@ impl NgoRegistry {
     /// ```
     pub fn register(env: Env, owner: Address, name: String) -> Result<(), Error> {
         owner.require_auth();
+
+        if name.is_empty() {
+            return Err(Error::InvalidName);
+        }
 
         let key = DataKey::Ngo(owner.clone());
         if env.storage().persistent().has(&key) {
@@ -292,7 +300,10 @@ impl NgoRegistry {
             .unwrap_or(0)
     }
 
-    /// Marks a registered NGO as verified. Admin-only.
+    /// Marks a registered NGO as verified. Admin-only. Fails with
+    /// `Error::AlreadyVerified` if the NGO is already verified, so a
+    /// repeated call can't rewrite the entry or publish a duplicate
+    /// `approved` event.
     ///
     /// # Examples
     ///
@@ -320,6 +331,9 @@ impl NgoRegistry {
             .persistent()
             .get(&key)
             .ok_or(Error::NotRegistered)?;
+        if ngo.verified {
+            return Err(Error::AlreadyVerified);
+        }
         ngo.verified = true;
         env.storage().persistent().set(&key, &ngo);
         extend_instance_ttl(&env);
@@ -333,7 +347,9 @@ impl NgoRegistry {
 
     /// Reverses a prior approval, marking a registered NGO as unverified
     /// again. Admin-only. Returns `Error::NotRegistered` for an address
-    /// with no entry, matching `approve_ngo`'s existing behavior.
+    /// with no entry, matching `approve_ngo`'s existing behavior, and
+    /// `Error::NotVerified` if the NGO isn't currently verified, so a
+    /// repeated call can't publish a duplicate `revoked` event.
     ///
     /// # Examples
     ///
@@ -362,6 +378,9 @@ impl NgoRegistry {
             .persistent()
             .get(&key)
             .ok_or(Error::NotRegistered)?;
+        if !ngo.verified {
+            return Err(Error::NotVerified);
+        }
         ngo.verified = false;
         env.storage().persistent().set(&key, &ngo);
         extend_instance_ttl(&env);
