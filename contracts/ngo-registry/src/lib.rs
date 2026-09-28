@@ -22,7 +22,7 @@ pub struct Ngo {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
     Ngo(Address),

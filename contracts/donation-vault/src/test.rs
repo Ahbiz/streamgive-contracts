@@ -145,8 +145,6 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
 
     // 20 more seconds pass, then the donor cancels.
     s.env.ledger().with_mut(|l| l.timestamp += 20);
-    s.client.cancel_stream(&stream_id);
-
     // 200 more settles to the NGO on cancel; the untouched 300 refunds to the donor.
     let refund = s.client.cancel_stream(&stream_id);
     assert_eq!(refund, 300);
@@ -168,6 +166,24 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     assert_eq!(stream.balance, 0);
     assert_eq!(stream.rate, 0);
     assert!(stream.cancelled);
+}
+
+#[test]
+fn one_stroop_per_second_stream_pays_and_rounds_fee_to_zero() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &100);
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &100, &1);
+    s.env.ledger().with_mut(|l| l.timestamp += 1);
+
+    assert_eq!(s.client.withdraw(&stream_id), 1);
+    assert_eq!(s.token.balance(&s.ngo), 1);
+    assert_eq!(s.token.balance(&treasury), 0);
 }
 
 #[test]
