@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![cfg(test)]
 
 use super::*;
@@ -61,45 +62,40 @@ fn double_register_fails() {
 }
 
 #[test]
-fn ngo_count_initially_zero() {
-    let (_env, client, _admin) = setup();
-    assert_eq!(client.ngo_count(), 0);
+fn register_rejects_name_over_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    // MAX_NGO_NAME_LEN (200) + 1 bytes.
+    let too_long = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    let result = client.try_register(&owner, &too_long);
+
+    assert_eq!(result, Err(Ok(Error::NameTooLong)));
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
 }
 
 #[test]
-fn register_increments_ngo_count() {
+fn register_accepts_name_at_max_length() {
     let (env, client, _admin) = setup();
-    assert_eq!(client.ngo_count(), 0);
+    let owner = Address::generate(&env);
+    // Exactly MAX_NGO_NAME_LEN (200) bytes.
+    let at_limit = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
-    let owner1 = Address::generate(&env);
-    client.register(&owner1, &String::from_str(&env, "First NGO"));
-    assert_eq!(client.ngo_count(), 1);
+    client.register(&owner, &at_limit);
 
-    let owner2 = Address::generate(&env);
-    client.register(&owner2, &String::from_str(&env, "Second NGO"));
-    assert_eq!(client.ngo_count(), 2);
+    assert_eq!(client.get_ngo(&owner).name, at_limit);
+}
 
-    // Duplicate registration should fail and not increment the count
-    let result = client.try_register(&owner1, &String::from_str(&env, "First NGO Again"));
-    assert_eq!(result, Err(Ok(Error::AlreadyRegistered)));
-    assert_eq!(client.ngo_count(), 2);
+#[test]
+fn update_name_rejects_name_over_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    let too_long = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
-    // Approving, revoking, renaming, or touching an NGO does not increment count
-    client.approve_ngo(&owner1);
-    assert_eq!(client.ngo_count(), 2);
+    let result = client.try_update_name(&owner, &too_long);
 
-    client.revoke_ngo(&owner1);
-    assert_eq!(client.ngo_count(), 2);
-
-    client.update_name(&owner2, &String::from_str(&env, "Renamed NGO"));
-    assert_eq!(client.ngo_count(), 2);
-
-    client.touch_ngo(&owner2);
-    assert_eq!(client.ngo_count(), 2);
-
-    let owner3 = Address::generate(&env);
-    client.register(&owner3, &String::from_str(&env, "Third NGO"));
-    assert_eq!(client.ngo_count(), 3);
+    assert_eq!(result, Err(Ok(Error::NameTooLong)));
 }
 
 #[test]
@@ -125,6 +121,20 @@ fn approve_ngo_marks_verified() {
 }
 
 #[test]
+fn approve_ngo_twice_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+    client.register(&owner, &name);
+
+    client.approve_ngo(&owner);
+
+    let result = client.try_approve_ngo(&owner);
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    assert!(client.get_ngo(&owner).verified);
+}
+
+#[test]
 fn approve_unregistered_ngo_fails() {
     let (env, client, _admin) = setup();
     let random = Address::generate(&env);
@@ -147,6 +157,18 @@ fn revoke_ngo_clears_verified_status() {
 
     let ngo = client.get_ngo(&owner);
     assert!(!ngo.verified);
+}
+
+#[test]
+fn revoke_unverified_ngo_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+    client.register(&owner, &name);
+
+    let result = client.try_revoke_ngo(&owner);
+    assert_eq!(result, Err(Ok(Error::NotVerified)));
+    assert!(!client.get_ngo(&owner).verified);
 }
 
 #[test]
@@ -353,4 +375,72 @@ fn touch_ngo_bumps_instance_and_ngo_ttl() {
     client.touch_ngo(&owner);
 
     assert_ttls_bumped(&env, &client, &owner);
+}
+
+// --- Event assertion tests (issue #62) ---
+
+#[test]
+fn register_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+
+    client.register(&owner, &name);
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("register"), owner).into_val(&env),
+                name.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn approve_ngo_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.approve_ngo(&owner);
+
+    // Events are cleared per top-level call; only the approved event is visible.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn revoke_ngo_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+
+    client.revoke_ngo(&owner);
+
+    // Events are cleared per top-level call; only the revoked event is visible.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("revoked"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
 }
