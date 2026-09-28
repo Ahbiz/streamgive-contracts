@@ -562,6 +562,26 @@ fn unpause_restores_normal_operation() {
 }
 
 #[test]
+fn pause_rejects_duplicate_pause() {
+    let s = setup();
+
+    s.client.pause();
+    assert_eq!(s.client.try_pause(), Err(Ok(Error::AlreadyPaused)));
+    assert!(s.client.paused());
+}
+
+#[test]
+fn unpause_rejects_duplicate_unpause() {
+    let s = setup();
+
+    assert_eq!(s.client.try_unpause(), Err(Ok(Error::AlreadyUnpaused)));
+    s.client.pause();
+    s.client.unpause();
+    assert_eq!(s.client.try_unpause(), Err(Ok(Error::AlreadyUnpaused)));
+    assert!(!s.client.paused());
+}
+
+#[test]
 fn withdraw_with_no_treasury_takes_no_fee() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
