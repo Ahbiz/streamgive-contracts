@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
 use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
-use soroban_sdk::{xdr, IntoVal, Symbol, TryFromVal, Val};
+use soroban_sdk::{vec, IntoVal, Symbol, Val, Vec};
 
 fn setup() -> (Env, NgoRegistryClient<'static>, Address) {
     let env = Env::default();
@@ -58,6 +58,48 @@ fn double_register_fails() {
     let result = client.try_register(&owner, &name);
 
     assert_eq!(result, Err(Ok(Error::AlreadyRegistered)));
+}
+
+#[test]
+fn ngo_count_initially_zero() {
+    let (_env, client, _admin) = setup();
+    assert_eq!(client.ngo_count(), 0);
+}
+
+#[test]
+fn register_increments_ngo_count() {
+    let (env, client, _admin) = setup();
+    assert_eq!(client.ngo_count(), 0);
+
+    let owner1 = Address::generate(&env);
+    client.register(&owner1, &String::from_str(&env, "First NGO"));
+    assert_eq!(client.ngo_count(), 1);
+
+    let owner2 = Address::generate(&env);
+    client.register(&owner2, &String::from_str(&env, "Second NGO"));
+    assert_eq!(client.ngo_count(), 2);
+
+    // Duplicate registration should fail and not increment the count
+    let result = client.try_register(&owner1, &String::from_str(&env, "First NGO Again"));
+    assert_eq!(result, Err(Ok(Error::AlreadyRegistered)));
+    assert_eq!(client.ngo_count(), 2);
+
+    // Approving, revoking, renaming, or touching an NGO does not increment count
+    client.approve_ngo(&owner1);
+    assert_eq!(client.ngo_count(), 2);
+
+    client.revoke_ngo(&owner1);
+    assert_eq!(client.ngo_count(), 2);
+
+    client.update_name(&owner2, &String::from_str(&env, "Renamed NGO"));
+    assert_eq!(client.ngo_count(), 2);
+
+    client.touch_ngo(&owner2);
+    assert_eq!(client.ngo_count(), 2);
+
+    let owner3 = Address::generate(&env);
+    client.register(&owner3, &String::from_str(&env, "Third NGO"));
+    assert_eq!(client.ngo_count(), 3);
 }
 
 #[test]
@@ -211,11 +253,30 @@ fn update_name_changes_name_before_approval() {
     let fixed = String::from_str(&env, "Red Cross");
     client.update_name(&owner, &fixed);
 
-    // soroban-sdk 27 returns a non-iterable `ContractEvents`, dropped
-    // `PartialEq` on `Val`, and only keeps the most recent invocation's
-    // events, so snapshot the raw XDR now, before `get_ngo` runs again.
+    // Events cover only the latest top-level call, so read them before
+    // `get_ngo` below replaces them.
     let events = env.events().all();
-    let event = events.events().last().unwrap();
+    let expected: Vec<(Address, Vec<Val>, Val)> = vec![
+        &env,
+        (
+            client.address.clone(),
+            (symbol_short!("renamed"), owner.clone()).into_val(&env),
+            fixed.into_val(&env),
+        ),
+    ];
+    assert_eq!(events, expected);
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("renamed"), owner.clone()).into_val(&env),
+                fixed.into_val(&env)
+            ),
+        ]
+    );
 
     assert_eq!(
         client.get_ngo(&owner),
@@ -224,21 +285,6 @@ fn update_name_changes_name_before_approval() {
             name: fixed.clone(),
             verified: false,
         }
-    );
-    let xdr::ContractEventBody::V0(body) = &event.body;
-    let expected_symbol: Val = symbol_short!("renamed").into_val(&env);
-    let expected_owner: Val = owner.into_val(&env);
-    let expected_name: Val = fixed.into_val(&env);
-    assert_eq!(
-        body.topics.as_slice(),
-        &[
-            xdr::ScVal::try_from_val(&env, &expected_symbol).unwrap(),
-            xdr::ScVal::try_from_val(&env, &expected_owner).unwrap(),
-        ]
-    );
-    assert_eq!(
-        body.data,
-        xdr::ScVal::try_from_val(&env, &expected_name).unwrap()
     );
 }
 

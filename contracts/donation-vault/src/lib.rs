@@ -63,6 +63,11 @@ pub enum Error {
     /// leave its type's range. Returned instead of letting the release
     /// profile's overflow checks panic and abort the transaction.
     ArithmeticOverflow = 9,
+    /// The donor and the NGO are the same address, so the stream would pay
+    /// the donor back their own deposit. Rejected at creation: a stream that
+    /// nets to zero still counts as a committed donation in the indexer and
+    /// on impact pages, which is a way to inflate those totals for free.
+    SelfStream = 10,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -682,12 +687,13 @@ impl DonationVault {
 
     /// Opens a new stream: pulls `deposit` of `token` from the donor into the
     /// vault, to be released to the NGO at `rate` per second on withdrawal.
+    /// `donor` and `ngo` must be distinct addresses.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// # use soroban_sdk::{testutils::Address as _, token, Address, Env};
-    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # use donation_vault::{DonationVault, DonationVaultClient, Error};
     /// # let env = Env::default();
     /// # env.mock_all_auths();
     /// # let contract_id = env.register(DonationVault, ());
@@ -703,6 +709,11 @@ impl DonationVault {
     /// // Stream 1_000 units of the token to `ngo` at 10 units/second.
     /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
     /// assert_eq!(client.get_stream(&stream_id).balance, 1_000);
+    ///
+    /// // A stream needs two distinct parties — the vault refuses to pay a
+    /// // donor back their own deposit.
+    /// let result = client.try_create_stream(&donor, &donor, &sac.address(), &1_000, &10);
+    /// assert_eq!(result, Err(Ok(Error::SelfStream)));
     /// ```
     pub fn create_stream(
         env: Env,
@@ -714,6 +725,13 @@ impl DonationVault {
     ) -> Result<u64, Error> {
         require_not_paused(&env)?;
         donor.require_auth();
+
+        // Checked before the deposit is pulled and before the amounts are
+        // validated: a self-stream is never a legitimate call regardless of
+        // how the other arguments look, and it must not reach the transfer.
+        if donor == ngo {
+            return Err(Error::SelfStream);
+        }
 
         if deposit <= 0 || rate <= 0 {
             return Err(Error::InvalidAmount);
@@ -858,10 +876,11 @@ impl DonationVault {
     ///
     /// // Settles the 200 already accrued to the NGO, refunds the
     /// // untouched 800 to the donor, and zeroes the stream out.
-    /// client.cancel_stream(&stream_id);
+    /// let refund = client.cancel_stream(&stream_id);
+    /// assert_eq!(refund, 800);
     /// assert_eq!(client.get_stream(&stream_id).balance, 0);
     /// ```
-    pub fn cancel_stream(env: Env, stream_id: u64) -> Result<(), Error> {
+    pub fn cancel_stream(env: Env, stream_id: u64) -> Result<i128, Error> {
         let key = DataKey::Stream(stream_id);
         let mut stream: Stream = env
             .storage()
@@ -897,7 +916,7 @@ impl DonationVault {
         env.events()
             .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
 
-        Ok(())
+        Ok(refund)
     }
 
     /// Adds more funds to an existing stream. Donor-auth-gated. Settles
