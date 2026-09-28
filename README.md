@@ -103,6 +103,42 @@ build, a wasm binary size check (see
 [`scripts/check-wasm-size.sh`](scripts/check-wasm-size.sh)), and
 `cargo test --workspace` on every push and pull request.
 
+## FAQ
+
+### Why is this project licensed under Apache-2.0?
+
+Apache-2.0 permits reuse and modification while providing an explicit patent
+license and clear contributor protections. That makes it a practical default
+for contracts intended to be integrated by wallets, applications, and other
+open-source projects.
+
+### Why are release overflow checks enabled?
+
+The contracts move token balances and calculate payouts with `i128`. A wrapped
+balance could silently corrupt funds, so release builds keep `overflow-checks`
+enabled and return explicit arithmetic errors where the contract can handle
+the failure.
+
+### Why are the contracts `no_std`?
+
+Soroban contracts run in a constrained WebAssembly environment. `no_std`
+keeps the deployed artifact small and avoids bringing operating-system
+facilities that are unavailable on-chain.
+
+### Why does each stream have its own TTL?
+
+Persistent storage is retained per key. A stream that is never touched can
+expire independently of the vault instance, so state-changing calls and the
+permissionless `extend_stream` entry point refresh the specific stream that
+needs to remain available.
+
+### What is the cancelled-stream grace period?
+
+The admin can configure `cancel_grace_ledgers` so indexers have additional
+time to observe and process a cancellation. Cancelling a stream retains its
+record for the normal stream TTL plus that configured grace period; a value of
+zero keeps the default retention period.
+
 ## Error codes
 
 Each contract exposes its failures as a `#[contracterror] enum Error`,

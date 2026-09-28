@@ -50,6 +50,8 @@ pub enum DataKey {
     Paused,
     Treasury,
     FeeBps,
+    /// Additional ledgers to retain a cancelled stream for indexing.
+    CancelGraceLedgers,
 }
 
 #[contracterror]
@@ -113,6 +115,20 @@ fn extend_stream_ttl(env: &Env, stream_id: u64) {
         STREAM_LIFETIME_THRESHOLD,
         STREAM_BUMP_AMOUNT,
     );
+}
+
+/// Extends a cancelled stream beyond the normal retention period by the
+/// configured indexing grace period.
+fn extend_cancelled_stream_ttl(env: &Env, stream_id: u64, grace_ledgers: u32) -> Result<(), Error> {
+    let bump_amount = STREAM_BUMP_AMOUNT
+        .checked_add(grace_ledgers)
+        .ok_or(Error::ArithmeticOverflow)?;
+    env.storage().persistent().extend_ttl(
+        &DataKey::Stream(stream_id),
+        STREAM_LIFETIME_THRESHOLD,
+        bump_amount,
+    );
+    Ok(())
 }
 
 /// Reads the configured admin and requires their auth, failing with
@@ -222,6 +238,9 @@ impl DonationVault {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextStreamId, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::CancelGraceLedgers, &0u32);
         extend_instance_ttl(&env);
         Ok(())
     }
@@ -780,6 +799,26 @@ impl DonationVault {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
+    /// Sets the number of additional ledgers that a cancelled stream remains
+    /// available for indexing after the normal stream TTL bump. Admin-gated.
+    /// A value of zero preserves the default stream retention period.
+    pub fn set_cancel_grace_ledgers(env: Env, grace_ledgers: u32) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::CancelGraceLedgers, &grace_ledgers);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Reads the additional cancelled-stream retention period, in ledgers.
+    pub fn cancel_grace_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CancelGraceLedgers)
+            .unwrap_or(0)
+    }
+
     /// Opens a new stream: pulls `deposit` of `token` from the donor into the
     /// vault, to be released to the NGO at `rate` per second on withdrawal.
     /// `donor` and `ngo` must be distinct addresses.
@@ -1001,7 +1040,12 @@ impl DonationVault {
         stream.last_update = now;
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
-        extend_stream_ttl(&env, stream_id);
+        let grace_ledgers = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancelGraceLedgers)
+            .unwrap_or(0);
+        extend_cancelled_stream_ttl(&env, stream_id, grace_ledgers)?;
 
         env.events()
             .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
