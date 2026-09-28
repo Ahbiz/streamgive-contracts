@@ -319,37 +319,35 @@ fn create_stream_rejects_non_positive_amounts() {
 }
 
 #[test]
-fn create_stream_rejects_donor_equal_to_ngo() {
+fn min_deposit_defaults_to_zero_and_does_not_block_small_deposits() {
     let s = setup();
-    s.token_admin.mint(&s.donor, &1_000);
+    assert_eq!(s.client.min_deposit(), 0);
 
-    // A donor streaming to itself would pay the deposit straight back out
-    // while the indexer counted it as a committed donation, so the vault
-    // refuses the stream outright.
-    let result = s
+    s.token_admin.mint(&s.donor, &1);
+    let stream_id = s
         .client
-        .try_create_stream(&s.donor, &s.donor, &s.token.address, &1_000, &10);
-    assert_eq!(result, Err(Ok(Error::SelfStream)));
-
-    // The rejected call is a no-op: no deposit is pulled, no stream id is
-    // handed out, and the donor keeps every unit.
-    assert_eq!(s.token.balance(&s.donor), 1_000);
-    assert_eq!(s.token.balance(&s.client.address), 0);
-    assert_eq!(s.client.stream_count(), 0);
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1, &1);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1);
 }
 
 #[test]
-fn create_stream_checks_the_parties_before_the_amounts() {
+fn create_stream_rejects_deposit_below_configured_minimum() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
 
-    // Both arguments are bad. The donor/NGO pair is validated before the
-    // amounts, so the caller gets SelfStream rather than InvalidAmount —
-    // worth pinning so the order can't quietly flip.
+    s.client.set_min_deposit(&100);
+    assert_eq!(s.client.min_deposit(), 100);
+
     let result = s
         .client
-        .try_create_stream(&s.donor, &s.donor, &s.token.address, &0, &10);
-    assert_eq!(result, Err(Ok(Error::SelfStream)));
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &99, &10);
+    assert_eq!(result, Err(Ok(Error::DepositTooLow)));
+
+    // Exactly the minimum still succeeds.
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &100, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 100);
 }
 
 #[test]
