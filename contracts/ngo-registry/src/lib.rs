@@ -27,6 +27,7 @@ pub enum DataKey {
     Admin,
     TotalNgos,
     Ngo(Address),
+    NgoCount,
 }
 
 #[contracterror]
@@ -170,15 +171,23 @@ impl NgoRegistry {
             verified: false,
         };
         env.storage().persistent().set(&key, &ngo);
-        let total_ngos: u32 = env
+        let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::TotalNgos)
+            .get(&DataKey::NgoCount)
             .unwrap_or(0);
+        let next_count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        let total_ngos: u32 = match env.storage().instance().get(&DataKey::TotalNgos) {
+            Some(total) => total,
+            None => u32::try_from(count).map_err(|_| Error::ArithmeticOverflow)?,
+        };
         let next_total = total_ngos.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         env.storage()
             .instance()
             .set(&DataKey::TotalNgos, &next_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::NgoCount, &next_count);
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &owner);
 
@@ -269,6 +278,36 @@ impl NgoRegistry {
             .persistent()
             .get(&DataKey::Ngo(owner))
             .ok_or(Error::NotRegistered)
+    }
+
+    /// Reads back the total number of registered NGOs.
+    ///
+    /// Lets callers (such as the impact page) display the total count
+    /// of registered NGOs without querying a backend indexer.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// assert_eq!(client.ngo_count(), 0);
+    ///
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// let owner = Address::generate(&env);
+    /// let name = String::from_str(&env, "Example NGO");
+    /// client.register(&owner, &name);
+    /// assert_eq!(client.ngo_count(), 1);
+    /// ```
+    pub fn ngo_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NgoCount)
+            .unwrap_or(0)
     }
 
     /// Marks a registered NGO as verified. Admin-only.
