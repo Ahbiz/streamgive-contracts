@@ -52,7 +52,41 @@ Emitted by `approve_ngo` when an admin marks a registered NGO as verified.
 | Topics | `("approved", ngo_owner: Address)` |
 | Data | `()` (no payload) |
 
+### `revoked`
+
+Emitted by `revoke_ngo` when an admin reverses a prior approval, marking a
+verified NGO as unverified again. This is the direct counterpart to
+`approved` for the same `ngo_owner` — an indexer should treat a `revoked`
+event as cancelling the most recent `approved` event for that address.
+
+| | |
+|---|---|
+| Topics | `("revoked", ngo_owner: Address)` |
+| Data | `()` (no payload) |
+
 ## `donation-vault`
+
+### `propadmin`
+
+Emitted by `propose_admin` when the current admin nominates a new admin.
+The transfer is not complete until the nominated address calls
+`accept_admin` and an `acptadmin` event is emitted.
+
+| | |
+|---|---|
+| Topics | `("propadmin",)` |
+| Data | `new_admin: Address` |
+
+### `acptadmin`
+
+Emitted by `accept_admin` when the nominated admin accepts the transfer.
+After this event the address in `data` is the active admin; the previous
+admin has no further authority.
+
+| | |
+|---|---|
+| Topics | `("acptadmin",)` |
+| Data | `new_admin: Address` |
 
 ### `pause`
 
