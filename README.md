@@ -122,6 +122,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
 | 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
 | 10   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`, which would stream the donor's own deposit back to them. |
+| 11   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
 
 ### `ngo-registry`
 

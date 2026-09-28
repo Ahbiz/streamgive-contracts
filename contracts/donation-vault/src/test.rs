@@ -843,6 +843,24 @@ fn modify_rate_rejects_non_positive_rate() {
 }
 
 #[test]
+fn modify_rate_on_cancelled_stream_fails() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    let result = s.client.try_modify_rate(&stream_id, &20);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+
+    // The rejected call leaves the cancelled stream's rate at zero — it
+    // must not be revivable via modify_rate.
+    assert_eq!(s.client.get_stream(&stream_id).rate, 0);
+}
+
+#[test]
 fn modify_rate_on_unknown_stream_fails() {
     let s = setup();
 
@@ -883,6 +901,25 @@ fn top_up_rejects_non_positive_amount() {
     assert_eq!(stream.withdrawn, 0);
     assert_eq!(s.token.balance(&s.donor), 500);
     assert_eq!(s.token.balance(&s.ngo), 0);
+}
+
+#[test]
+fn top_up_on_cancelled_stream_fails() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    let result = s.client.try_top_up(&stream_id, &500);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+
+    // The rejected call moves no tokens: the donor still holds the full
+    // 1_000 refunded by cancel_stream (no time passed, so nothing accrued).
+    assert_eq!(s.token.balance(&s.donor), 2_000);
+    assert_eq!(s.token.balance(&s.client.address), 0);
 }
 
 #[test]
