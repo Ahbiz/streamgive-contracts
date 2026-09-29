@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = "27.0.6"
+ngo-registry = { path = "../ngo-registry" }
 
 [dev-dependencies]
 soroban-sdk = { version = "27.0.6", features = ["testutils"] }
