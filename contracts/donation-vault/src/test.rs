@@ -133,6 +133,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
             )
                 .into_val(&s.env),
         )
+            .into_val(&s.env),
     );
     assert_eq!(s.token.balance(&s.donor), 0);
     assert_eq!(s.token.balance(&s.client.address), 1_000);
