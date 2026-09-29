@@ -390,6 +390,41 @@ fn accept_admin_without_proposal_fails() {
     assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
 }
 
+// ── Issue #72 ─────────────────────────────────────────────────────────────────
+// propose_admin overwrites rather than queues, so the first proposed address
+// is silently dropped. That's the desired behaviour, but nothing pinned it:
+// a future change to "keep the earliest proposal" or "reject a second one"
+// would lock an admin out with no way to tell from the outside.
+
+#[test]
+fn repropose_admin_overwrites_earlier_proposal() {
+    let s = setup();
+    let old_admin = s.client.admin();
+    let admin_a = Address::generate(&s.env);
+    let admin_b = Address::generate(&s.env);
+
+    s.client.propose_admin(&admin_a);
+    assert_eq!(s.client.pending_admin(), Some(admin_a.clone()));
+
+    // Proposing again replaces the pending address instead of queueing.
+    s.client.propose_admin(&admin_b);
+    assert_eq!(
+        s.client.pending_admin(),
+        Some(admin_b.clone()),
+        "the second proposal must overwrite the first, not queue behind it"
+    );
+
+    // A is no longer the pending admin, so accept_admin now requires B's auth
+    // and not A's.
+    s.client.accept_admin();
+    assert_auth_required_from(&s, &admin_b, "accept_admin");
+
+    // Control actually moved to B, and only to B.
+    assert_eq!(s.client.admin(), admin_b);
+    assert_ne!(s.client.admin(), old_admin);
+    assert_ne!(s.client.admin(), admin_a);
+}
+
 #[test]
 fn cancel_admin_proposal_without_proposal_fails() {
     let s = setup();
