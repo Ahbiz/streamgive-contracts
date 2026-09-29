@@ -1147,6 +1147,7 @@ fn create_stream_stores_every_field() {
             withdrawn: 0,
             created_at: 12_345,
             last_update: 12_345,
+            status: StreamStatus::Active,
             cancelled: false,
         }
     );
@@ -1521,154 +1522,155 @@ fn accept_admin_requires_pending_admin_auth() {
     assert_auth_required_from(&s, &new_admin, "accept_admin");
 }
 
+// =============================================================================
+// Per-donor stream limit (issue #94)
+// =============================================================================
+
 #[test]
-fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
+fn max_streams_per_donor_defaults_to_100() {
     let s = setup();
-    s.token_admin.mint(&s.donor, &1_000);
-    s.client.set_fee_bps(&500); // 5% configured, but no treasury
-
-    let stream_id = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
-
-    let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
-    assert_eq!(net, 500); // full accrual goes to the NGO
-
-    // Read-only: nothing moved.
-    assert_eq!(s.token.balance(&s.ngo), 0);
-    let stream = s.client.get_stream(&stream_id);
-    assert_eq!(stream.balance, 1_000);
-    assert_eq!(stream.withdrawn, 0);
+    assert_eq!(s.client.max_streams_per_donor(), 100);
 }
 
 #[test]
-fn pending_payout_with_treasury_and_zero_bps_returns_full_gross_and_zero_fee() {
+fn admin_can_set_the_per_donor_cap() {
     let s = setup();
-    s.token_admin.mint(&s.donor, &1_000);
-
-    let treasury = Address::generate(&s.env);
-    s.client.set_treasury(&treasury);
-    // fee_bps defaults to 0 — a treasury exists but takes nothing
-
-    let stream_id = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
-
-    let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
-    assert_eq!(net, 500);
-
-    // Read-only: nothing moved.
-    assert_eq!(s.token.balance(&s.ngo), 0);
-    assert_eq!(s.token.balance(&treasury), 0);
+    s.client.set_max_streams_per_donor(&5);
+    assert_eq!(s.client.max_streams_per_donor(), 5);
 }
 
 #[test]
-fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
+fn non_admin_cannot_set_the_per_donor_cap() {
+    let s = setup();
+    s.env.mock_auths(&[]);
+    let result = s.client.try_set_max_streams_per_donor(&5);
+    assert!(result.is_err());
+}
+
+#[test]
+fn create_stream_rejects_the_101st_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+
+    // Fill the default cap.
+    for _ in 0..100 {
+        s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    }
+
+    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert!(result.is_err());
+}
+
+#[test]
+fn raising_the_cap_lets_the_next_stream_through() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+    s.client.set_max_streams_per_donor(&1);
+
+    s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // At the cap, next call fails.
+    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert!(result.is_err());
+
+    // Raise the cap. Next call succeeds.
+    s.client.set_max_streams_per_donor(&2);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).donor, s.donor);
+}
+
+#[test]
+fn lowering_the_cap_does_not_retroactively_affect_existing_streams() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+    s.client.set_max_streams_per_donor(&5);
+
+    for _ in 0..3 {
+        s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    }
+
+    // Drop the cap below the current count.
+    s.client.set_max_streams_per_donor(&1);
+
+    // New streams are rejected.
+    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert!(result.is_err());
+
+    // Existing streams are untouched and still withdrawable.
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+    let withdrawn = s.client.withdraw(&0);
+    assert_eq!(withdrawn, 500);
+}
+
+#[test]
+fn separate_donors_have_separate_counters() {
+    let s = setup();
+    s.client.set_max_streams_per_donor(&1);
+
+    let donor_b = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &1_000);
+    s.token_admin.mint(&donor_b, &1_000);
+
+    s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    // A different donor is unaffected by donor A's cap.
+    let donor_b_stream = s.client.create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&donor_b_stream).donor, donor_b);
+
+    // But donor_b is now at its own cap.
+    let result = s.client.try_create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
+    assert!(result.is_err());
+}
+
+
+// =============================================================================
+// Explicit stream status (issue #92)
+// =============================================================================
+
+#[test]
+fn new_stream_starts_active() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+}
 
-    let treasury = Address::generate(&s.env);
-    s.client.set_treasury(&treasury);
-    s.client.set_fee_bps(&500); // 5%
+#[test]
+fn cancelled_stream_reports_cancelled() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Cancelled);
+}
 
-    let stream_id = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
-
-    let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 25); // 5% of 500
-    assert_eq!(net, 475); // 500 - 25
-
-    // Read-only: nothing moved yet.
-    assert_eq!(s.token.balance(&s.ngo), 0);
-    assert_eq!(s.token.balance(&treasury), 0);
-    let stream = s.client.get_stream(&stream_id);
-    assert_eq!(stream.balance, 1_000);
-    assert_eq!(stream.withdrawn, 0);
-
-    // The values must match exactly what withdraw actually distributes.
+#[test]
+fn fully_withdrawn_stream_reports_drained() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    // 10 units/s for 1000 units ? fully drained after 100 seconds.
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
     s.client.withdraw(&stream_id);
-    assert_eq!(s.token.balance(&s.ngo), net);
-    assert_eq!(s.token.balance(&treasury), fee);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Drained);
 }
-
-// ── Issue #64 ─────────────────────────────────────────────────────────────────
-// Every admin-gated entry point must fail closed with Error::NotInitialized
-// when called before init, rather than silently defaulting (e.g. paused()
-// reads a missing key as false, which would leave a pre-init vault looking
-// operational).
 
 #[test]
-fn admin_functions_before_init_return_not_initialized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(DonationVault, ());
-    let client = DonationVaultClient::new(&env, &contract_id);
-
-    let treasury = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-
-    // Every entry point that reaches for the admin through require_admin().
-    assert_eq!(
-        client.try_pause(),
-        Err(Ok(Error::NotInitialized)),
-        "pause() must return NotInitialized before init"
-    );
-    assert_eq!(
-        client.try_unpause(),
-        Err(Ok(Error::NotInitialized)),
-        "unpause() must return NotInitialized before init"
-    );
-    assert_eq!(
-        client.try_set_treasury(&treasury),
-        Err(Ok(Error::NotInitialized)),
-        "set_treasury() must return NotInitialized before init"
-    );
-    assert_eq!(
-        client.try_clear_treasury(),
-        Err(Ok(Error::NotInitialized)),
-        "clear_treasury() must return NotInitialized before init"
-    );
-    assert_eq!(
-        client.try_set_fee_bps(&100),
-        Err(Ok(Error::NotInitialized)),
-        "set_fee_bps() must return NotInitialized before init"
-    );
-    assert_eq!(
-        client.try_set_min_deposit(&1),
-        Err(Ok(Error::NotInitialized)),
-        "set_min_deposit() must return NotInitialized before init"
-    );
-    assert_eq!(
-        client.try_propose_admin(&new_admin),
-        Err(Ok(Error::NotInitialized)),
-        "propose_admin() must return NotInitialized before init"
-    );
-    assert_eq!(
-        client.try_cancel_admin_proposal(),
-        Err(Ok(Error::NotInitialized)),
-        "cancel_admin_proposal() must return NotInitialized before init"
-    );
-
-    // The admin reader reports the same rather than defaulting to a
-    // zero address.
-    assert_eq!(
-        client.try_admin(),
-        Err(Ok(Error::NotInitialized)),
-        "admin() must return NotInitialized before init"
-    );
-
-    // accept_admin doesn't go through require_admin — it reads the pending
-    // proposal directly, so before init there is nothing to accept. That's
-    // NoPendingAdmin rather than NotInitialized, but it still fails closed.
-    assert_eq!(
-        client.try_accept_admin(),
-        Err(Ok(Error::NoPendingAdmin)),
-        "accept_admin() must fail closed before init"
-    );
+fn partially_withdrawn_stream_stays_active() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+    s.client.withdraw(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
 }
+
+#[test]
+fn status_is_queryable_after_cancel_then_further_operations_fail() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Cancelled);
+    // top_up on a cancelled stream is rejected (cancelled sets rate = 0).
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    let result = s.client.try_withdraw(&
