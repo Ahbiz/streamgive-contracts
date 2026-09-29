@@ -107,6 +107,22 @@ Emitted by `unpause` when an admin lifts a pause.
 | Topics | `("unpause",)` |
 | Data | `()` (no payload) |
 
+### `feeset`
+
+Emitted by `set_fee_bps` when an admin changes the protocol fee.
+
+| | |
+|---|---|
+| Topics | `("feeset",)` |
+| Data | `fee_bps: u32` (the new fee, in basis points) |
+
+The fee is capped at `MAX_FEE_BPS` (1,000 / 10%); calls above the cap fail
+with `FeeTooHigh` and emit nothing. The event carries the full new value
+(not a delta), so an indexer can track the fee without polling `fee_bps`.
+"Accepted" here means stored, not effective: the fee only affects payouts
+once a treasury is set, so pair this with `set_treasury`/`treasury()` when
+deriving an actual split.
+
 ### `created`
 
 Emitted by `create_stream` when a donor opens a new stream.
@@ -135,6 +151,10 @@ actually receives `accrued` minus the fee, with the fee paid to the
 treasury in the same transaction. No separate fee event is emitted; derive
 the split from the vault's `fee_bps()`/`treasury()` at the time of the
 transaction.
+
+The `withdraw` entry point **returns** that same net amount (gross minus
+fee), so a caller displaying the payout can use the return value directly;
+the event data stays gross, matching the stream's `withdrawn` bookkeeping.
 
 ### `cancel`
 
@@ -171,7 +191,18 @@ rate.
 | | |
 |---|---|
 | Topics | `("ratemod", stream_id: u64)` |
-| Data | `new_rate: i128` |
+| Data | `(old_rate: i128, new_rate: i128)` |
 
 As with `top_up`, any balance already accrued at the old rate is settled to
-the NGO first, so the new rate only ever applies going forward.
+the NGO first, so the new rate only ever applies going forward. The event
+records both values so an indexer can calculate the change without another
+state query.
+
+### `unregist`
+
+Emitted by `ngo-registry` when an unverified NGO removes its own application.
+
+| | |
+|---|---|
+| Topics | `("unregist", owner: Address)` |
+| Data | `()` (no payload) |

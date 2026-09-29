@@ -9,7 +9,7 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
 };
 
 #[contracttype]
@@ -198,6 +198,30 @@ impl NgoRegistry {
 
         env.events()
             .publish((symbol_short!("register"), owner), name);
+
+        Ok(())
+    }
+
+    /// Removes the caller's unverified NGO application.
+    ///
+    /// Verified registrations are intentionally permanent until an admin
+    /// revokes verification.
+    pub fn unregister(env: Env, owner: Address) -> Result<(), Error> {
+        owner.require_auth();
+
+        let key = DataKey::Ngo(owner.clone());
+        let ngo: Ngo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotRegistered)?;
+        if ngo.verified {
+            return Err(Error::AlreadyVerified);
+        }
+
+        env.storage().persistent().remove(&key);
+        extend_instance_ttl(&env);
+        env.events().publish((symbol_short!("unregist"), owner), ());
 
         Ok(())
     }
@@ -431,6 +455,30 @@ impl NgoRegistry {
         }
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &owner);
+        Ok(())
+    }
+
+    /// Replaces the contract's Wasm bytecode in place. Admin-only.
+    /// Lets a bug fix be deployed without changing the contract address,
+    /// preserving every existing NGO entry and the admin key.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+    /// client.upgrade(&new_wasm_hash);
+    /// ```
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
 }
