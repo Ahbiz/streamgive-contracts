@@ -270,7 +270,7 @@ fn top_up_and_modify_rate_settle_before_changing() {
         last_event(&s.env),
         (
             (symbol_short!("ratemod"), stream_id).into_val(&s.env),
-            20i128.into_val(&s.env),
+            (10i128, 20i128).into_val(&s.env),
         )
     );
     assert_eq!(s.token.balance(&s.ngo), 150);
@@ -754,6 +754,33 @@ fn set_fee_bps_boundary_exact_max_succeeds() {
     // can't hide behind a different error path.
     let result = s.client.try_set_fee_bps(&1_001);
     assert_eq!(result, Err(Ok(Error::FeeTooHigh)));
+}
+
+#[test]
+fn min_deposit_setter_and_guard() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    s.client.set_min_deposit(&1_000);
+    assert_eq!(s.client.min_deposit(), 1_000);
+
+    assert_eq!(
+        s.client
+            .try_create_stream(&s.donor, &s.ngo, &s.token.address, &999, &10),
+        Err(Ok(Error::DepositTooLow))
+    );
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn min_deposit_requires_non_negative_admin_value() {
+    let s = setup();
+    assert_eq!(
+        s.client.try_set_min_deposit(&-1),
+        Err(Ok(Error::InvalidAmount))
+    );
 }
 
 #[test]
@@ -1407,7 +1434,7 @@ fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0);   // no treasury → no fee, regardless of fee_bps
+    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
     assert_eq!(net, 500); // full accrual goes to the NGO
 
     // Read-only: nothing moved.
@@ -1432,7 +1459,7 @@ fn pending_payout_with_treasury_and_zero_bps_returns_full_gross_and_zero_fee() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0);   // 0 bps → zero fee even with a treasury set
+    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
     assert_eq!(net, 500);
 
     // Read-only: nothing moved.
@@ -1455,7 +1482,7 @@ fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 25);  // 5% of 500
+    assert_eq!(fee, 25); // 5% of 500
     assert_eq!(net, 475); // 500 - 25
 
     // Read-only: nothing moved yet.

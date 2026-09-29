@@ -42,6 +42,8 @@ pub enum Error {
     AlreadyVerified = 5,
     /// `name` is longer than `MAX_NGO_NAME_LEN`.
     NameTooLong = 6,
+    /// The NGO has not been approved, so it cannot be revoked.
+    NotVerified = 7,
 }
 
 /// Upper bound on `Ngo.name`, in bytes. Persistent storage cost scales with
@@ -196,6 +198,30 @@ impl NgoRegistry {
 
         env.events()
             .publish((symbol_short!("register"), owner), name);
+
+        Ok(())
+    }
+
+    /// Removes the caller's unverified NGO application.
+    ///
+    /// Verified registrations are intentionally permanent until an admin
+    /// revokes verification.
+    pub fn unregister(env: Env, owner: Address) -> Result<(), Error> {
+        owner.require_auth();
+
+        let key = DataKey::Ngo(owner.clone());
+        let ngo: Ngo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotRegistered)?;
+        if ngo.verified {
+            return Err(Error::AlreadyVerified);
+        }
+
+        env.storage().persistent().remove(&key);
+        extend_instance_ttl(&env);
+        env.events().publish((symbol_short!("unregist"), owner), ());
 
         Ok(())
     }
