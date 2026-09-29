@@ -160,12 +160,13 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
 | 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
-| 9    | `ArithmeticOverflow`  | A balance, payout, or stream-id calculation exceeded its supported range. |
+| 9    | `ArithmeticOverflow`  | A stream balance, withdrawn total, or stream ID would exceed its integer range. |
 | 10   | `DepositTooLow`       | `create_stream` was called with a deposit below the admin-configured minimum. |
 | 11   | `AlreadyPaused`       | `pause` was called when the vault was already paused. |
 | 12   | `AlreadyUnpaused`     | `unpause` was called when the vault was already active. |
 | 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
 | 14   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
+| 15   | `InvalidAdmin`        | `propose_admin` was called with the current admin instead of a different address. |
 
 ### `ngo-registry`
 

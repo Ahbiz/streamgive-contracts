@@ -395,6 +395,18 @@ fn propose_then_accept_admin_transfers_control() {
 }
 
 #[test]
+fn propose_admin_rejects_current_admin() {
+    let s = setup();
+    let admin = s.client.admin();
+
+    assert_eq!(
+        s.client.try_propose_admin(&admin),
+        Err(Ok(Error::InvalidAdmin))
+    );
+    assert_eq!(s.client.pending_admin(), None);
+}
+
+#[test]
 fn accept_admin_without_proposal_fails() {
     let s = setup();
     let result = s.client.try_accept_admin();
@@ -1539,6 +1551,9 @@ fn admin_can_set_the_per_donor_cap() {
     assert_eq!(s.client.max_streams_per_donor(), 5);
 }
 
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
+    assert_eq!(net, 500); // full accrual goes to the NGO
 #[test]
 fn non_admin_cannot_set_the_per_donor_cap() {
     let s = setup();
@@ -1579,6 +1594,9 @@ fn raising_the_cap_lets_the_next_stream_through() {
     assert_eq!(s.client.get_stream(&stream_id).donor, s.donor);
 }
 
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
+    assert_eq!(net, 500);
 #[test]
 fn lowering_the_cap_does_not_retroactively_affect_existing_streams() {
     let s = setup();
@@ -1621,6 +1639,9 @@ fn separate_donors_have_separate_counters() {
     assert!(result.is_err());
 }
 
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 25); // 5% of 500
+    assert_eq!(net, 475); // 500 - 25
 
 // =============================================================================
 // Explicit stream status (issue #92)

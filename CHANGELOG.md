@@ -27,6 +27,7 @@ This project does not yet follow a formal versioning scheme — each contract's
   diagnostics.
 - `donation-vault`: two-step admin transfer via `propose_admin` /
   `accept_admin`.
+- `donation-vault`: reject self-admin proposals with `Error::InvalidAdmin`.
 - `ngo-registry`: contract skeleton with storage types and `init`.
 - `ngo-registry`: NGO application/registration via `register`.
 - `ngo-registry`: admin-gated `approve_ngo`.
