@@ -96,9 +96,11 @@ Notable coverage:
   (`invariants_hold_across_a_grid_of_inputs`) that checks, across a
   matrix of rates, balances, and elapsed durations, that accrual is
   always non-negative, never exceeds the remaining balance, and is
-  monotonically non-decreasing as elapsed time (or rate) grows — a
-  stand-in for property-based testing over the streaming math's edge
-  cases.
+  monotonically non-decreasing as elapsed time (or rate) grows.
+- A `proptest`-based `fuzz` module checks the same invariants (plus
+  monotonicity in balance and agreement with exact arithmetic) against
+  randomly generated `rate`/`elapsed`/`balance` inputs, biased towards
+  the zero and near-`MAX` edges.
 
 CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
 `cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
