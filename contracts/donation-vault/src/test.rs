@@ -45,6 +45,17 @@ fn last_event(env: &Env) -> LastEvent {
     }
 }
 
+/// The number of events emitted by `contract`. Filters by contract address
+/// so token transfers firing inside the same invocation don't inflate the
+/// count, and only covers the most recent invocation.
+fn event_count(env: &Env, contract: &Address) -> usize {
+    env.events()
+        .all()
+        .filter_by_contract(contract)
+        .events()
+        .len()
+}
+
 fn create_token<'a>(env: &Env, admin: &Address) -> (TokenClient<'a>, StellarAssetClient<'a>) {
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
     (
@@ -270,7 +281,7 @@ fn top_up_and_modify_rate_settle_before_changing() {
         last_event(&s.env),
         (
             (symbol_short!("ratemod"), stream_id).into_val(&s.env),
-            20i128.into_val(&s.env),
+            (10i128, 20i128).into_val(&s.env),
         )
     );
     assert_eq!(s.token.balance(&s.ngo), 150);
@@ -381,6 +392,41 @@ fn accept_admin_without_proposal_fails() {
     let s = setup();
     let result = s.client.try_accept_admin();
     assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+}
+
+// ── Issue #72 ─────────────────────────────────────────────────────────────────
+// propose_admin overwrites rather than queues, so the first proposed address
+// is silently dropped. That's the desired behaviour, but nothing pinned it:
+// a future change to "keep the earliest proposal" or "reject a second one"
+// would lock an admin out with no way to tell from the outside.
+
+#[test]
+fn repropose_admin_overwrites_earlier_proposal() {
+    let s = setup();
+    let old_admin = s.client.admin();
+    let admin_a = Address::generate(&s.env);
+    let admin_b = Address::generate(&s.env);
+
+    s.client.propose_admin(&admin_a);
+    assert_eq!(s.client.pending_admin(), Some(admin_a.clone()));
+
+    // Proposing again replaces the pending address instead of queueing.
+    s.client.propose_admin(&admin_b);
+    assert_eq!(
+        s.client.pending_admin(),
+        Some(admin_b.clone()),
+        "the second proposal must overwrite the first, not queue behind it"
+    );
+
+    // A is no longer the pending admin, so accept_admin now requires B's auth
+    // and not A's.
+    s.client.accept_admin();
+    assert_auth_required_from(&s, &admin_b, "accept_admin");
+
+    // Control actually moved to B, and only to B.
+    assert_eq!(s.client.admin(), admin_b);
+    assert_ne!(s.client.admin(), old_admin);
+    assert_ne!(s.client.admin(), admin_a);
 }
 
 #[test]
@@ -750,6 +796,33 @@ fn set_fee_bps_boundary_exact_max_succeeds() {
 }
 
 #[test]
+fn min_deposit_setter_and_guard() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    s.client.set_min_deposit(&1_000);
+    assert_eq!(s.client.min_deposit(), 1_000);
+
+    assert_eq!(
+        s.client
+            .try_create_stream(&s.donor, &s.ngo, &s.token.address, &999, &10),
+        Err(Ok(Error::DepositTooLow))
+    );
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn min_deposit_requires_non_negative_admin_value() {
+    let s = setup();
+    assert_eq!(
+        s.client.try_set_min_deposit(&-1),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
 #[should_panic]
 fn withdraw_fails_for_non_ngo_caller() {
     let s = setup();
@@ -848,6 +921,11 @@ fn cancel_stream_twice_is_harmless() {
     let refund = s.client.cancel_stream(&stream_id);
     assert_eq!(refund, 0);
 
+    // Sampled here, before any further SDK call: `events().all()` only covers
+    // the most recent invocation, so reading a balance or the stream below
+    // would reset the buffer and make the comparison below vacuous.
+    let events_after_second_cancel = event_count(&s.env, &s.client.address);
+
     assert_eq!(s.token.balance(&s.ngo), 500);
     assert_eq!(s.token.balance(&s.donor), 500);
 
@@ -856,6 +934,14 @@ fn cancel_stream_twice_is_harmless() {
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 500);
     assert!(stream.cancelled);
+
+    // accrued and refund were both zero, so the second cancel must publish
+    // nothing. A duplicate cancel event is indistinguishable from a real
+    // cancellation to an indexer watching the topic (issue #91).
+    assert_eq!(
+        events_after_second_cancel, 0,
+        "a duplicate cancel event was emitted for an already-cancelled stream"
+    );
 }
 
 #[test]
@@ -1400,7 +1486,7 @@ fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0);   // no treasury → no fee, regardless of fee_bps
+    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
     assert_eq!(net, 500); // full accrual goes to the NGO
 
     // Read-only: nothing moved.
@@ -1425,7 +1511,7 @@ fn pending_payout_with_treasury_and_zero_bps_returns_full_gross_and_zero_fee() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0);   // 0 bps → zero fee even with a treasury set
+    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
     assert_eq!(net, 500);
 
     // Read-only: nothing moved.
@@ -1448,7 +1534,7 @@ fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 25);  // 5% of 500
+    assert_eq!(fee, 25); // 5% of 500
     assert_eq!(net, 475); // 500 - 25
 
     // Read-only: nothing moved yet.
@@ -1462,4 +1548,80 @@ fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
     s.client.withdraw(&stream_id);
     assert_eq!(s.token.balance(&s.ngo), net);
     assert_eq!(s.token.balance(&treasury), fee);
+}
+
+// ── Issue #64 ─────────────────────────────────────────────────────────────────
+// Every admin-gated entry point must fail closed with Error::NotInitialized
+// when called before init, rather than silently defaulting (e.g. paused()
+// reads a missing key as false, which would leave a pre-init vault looking
+// operational).
+
+#[test]
+fn admin_functions_before_init_return_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DonationVault, ());
+    let client = DonationVaultClient::new(&env, &contract_id);
+
+    let treasury = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    // Every entry point that reaches for the admin through require_admin().
+    assert_eq!(
+        client.try_pause(),
+        Err(Ok(Error::NotInitialized)),
+        "pause() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_unpause(),
+        Err(Ok(Error::NotInitialized)),
+        "unpause() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_set_treasury(&treasury),
+        Err(Ok(Error::NotInitialized)),
+        "set_treasury() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_clear_treasury(),
+        Err(Ok(Error::NotInitialized)),
+        "clear_treasury() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_set_fee_bps(&100),
+        Err(Ok(Error::NotInitialized)),
+        "set_fee_bps() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_set_min_deposit(&1),
+        Err(Ok(Error::NotInitialized)),
+        "set_min_deposit() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_propose_admin(&new_admin),
+        Err(Ok(Error::NotInitialized)),
+        "propose_admin() must return NotInitialized before init"
+    );
+    assert_eq!(
+        client.try_cancel_admin_proposal(),
+        Err(Ok(Error::NotInitialized)),
+        "cancel_admin_proposal() must return NotInitialized before init"
+    );
+
+    // The admin reader reports the same rather than defaulting to a
+    // zero address.
+    assert_eq!(
+        client.try_admin(),
+        Err(Ok(Error::NotInitialized)),
+        "admin() must return NotInitialized before init"
+    );
+
+    // accept_admin doesn't go through require_admin — it reads the pending
+    // proposal directly, so before init there is nothing to accept. That's
+    // NoPendingAdmin rather than NotInitialized, but it still fails closed.
+    assert_eq!(
+        client.try_accept_admin(),
+        Err(Ok(Error::NoPendingAdmin)),
+        "accept_admin() must fail closed before init"
+    );
 }

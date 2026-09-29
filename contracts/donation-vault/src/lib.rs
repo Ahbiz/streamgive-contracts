@@ -51,6 +51,7 @@ pub enum DataKey {
     Treasury,
     FeeBps,
     MinDeposit,
+    CancelGraceLedgers,
 }
 
 #[contracterror]
@@ -250,6 +251,7 @@ impl DonationVault {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextStreamId, &0u64);
+        env.storage().instance().set(&DataKey::MinDeposit, &0i128);
         env.storage()
             .instance()
             .set(&DataKey::CancelGraceLedgers, &0u32);
@@ -881,6 +883,28 @@ impl DonationVault {
             .unwrap_or(0)
     }
 
+    /// Sets how many additional ledgers a cancelled stream remains available
+    /// for indexers after the normal stream-retention period. Admin-only.
+    pub fn set_cancel_grace_ledgers(env: Env, grace_ledgers: u32) -> Result<(), Error> {
+        require_admin(&env)?;
+        STREAM_BUMP_AMOUNT
+            .checked_add(grace_ledgers)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::CancelGraceLedgers, &grace_ledgers);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Returns the configured cancelled-stream indexing grace period.
+    pub fn cancel_grace_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CancelGraceLedgers)
+            .unwrap_or(0)
+    }
+
     /// Opens a new stream: pulls `deposit` of `token` from the donor into the
     /// vault, to be released to the NGO at `rate` per second on withdrawal.
     /// `donor` and `ngo` must be distinct addresses.
@@ -1106,8 +1130,14 @@ impl DonationVault {
             .unwrap_or(0);
         extend_cancelled_stream_ttl(&env, stream_id, grace_ledgers)?;
 
-        env.events()
-            .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
+        // Only emit the cancel event when something actually moved. When
+        // both values are zero the stream was already cancelled — emitting
+        // here would produce a duplicate that an indexer can't distinguish
+        // from a real cancellation (see issue #91).
+        if accrued > 0 || refund > 0 {
+            env.events()
+                .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
+        }
 
         Ok(refund)
     }
@@ -1226,6 +1256,7 @@ impl DonationVault {
             .ok_or(Error::StreamNotFound)?;
 
         stream.donor.require_auth();
+        let old_rate = stream.rate;
 
         if stream.cancelled {
             return Err(Error::StreamCancelled);
@@ -1240,7 +1271,7 @@ impl DonationVault {
         extend_stream_ttl(&env, stream_id);
 
         env.events()
-            .publish((symbol_short!("ratemod"), stream_id), new_rate);
+            .publish((symbol_short!("ratemod"), stream_id), (old_rate, new_rate));
 
         Ok(())
     }
