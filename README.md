@@ -100,6 +100,17 @@ Notable coverage:
   stand-in for property-based testing over the streaming math's edge
   cases.
 
+To run the full local check before pushing (formatting, clippy, then
+tests, stopping on the first failure):
+
+```sh
+make check
+```
+
+This runs `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace`, matching what CI runs.
+
 CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
 `cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
 build, a wasm binary size check (see
