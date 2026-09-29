@@ -138,6 +138,9 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     assert_eq!(s.token.balance(&s.donor), 0);
     assert_eq!(s.token.balance(&s.client.address), 1_000);
 
+    assert_eq!(s.token.balance(&s.donor), 0);
+    assert_eq!(s.token.balance(&s.client.address), 1_000);
+
     // 50 seconds pass -> 10/s * 50 = 500 should be withdrawable.
     s.env.ledger().with_mut(|l| l.timestamp += 50);
 
@@ -689,7 +692,17 @@ fn withdraw_splits_protocol_fee_to_treasury() {
 
     let treasury = Address::generate(&s.env);
     s.client.set_treasury(&treasury);
+    assert_last_event(
+        &s.env,
+        (symbol_short!("treasury"),).into_val(&s.env),
+        treasury.clone().into_val(&s.env),
+    );
     s.client.set_fee_bps(&500); // 5%
+    assert_last_event(
+        &s.env,
+        (symbol_short!("feebps"),).into_val(&s.env),
+        500u32.into_val(&s.env),
+    );
 
     let stream_id = s
         .client

@@ -735,6 +735,9 @@ impl DonationVault {
         require_admin(&env)?;
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         extend_instance_ttl(&env);
+
+        env.events().publish((symbol_short!("treasury"),), treasury);
+
         Ok(())
     }
 
