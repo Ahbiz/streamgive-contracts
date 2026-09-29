@@ -1,42 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
 #![cfg(test)]
 
 use super::*;
 use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
 use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
-use soroban_sdk::{xdr, IntoVal, Symbol, TryFromVal, Val, Vec};
-
-/// Asserts that the most recently published event has the given topics and
-/// data.
-///
-/// Must be called immediately after the call that emits the event. In
-/// soroban-sdk 27 `Events::all()` returns only the events of the *last*
-/// contract invocation, so an intervening call (any `get_*` read) replaces
-/// the event list with that call's — usually empty — one before the
-/// assertion runs.
-///
-/// The SDK's `ContractEvents` compares against raw XDR and `Val` deliberately
-/// doesn't implement `PartialEq`, so the last event is rebuilt in XDR form and
-/// compared there. This mirrors how `soroban_sdk::testutils` itself compares
-/// events.
-fn assert_last_event(env: &Env, topics: Vec<Val>, data: Val) {
-    let all = env.events().all();
-    let last = all.events().last().expect("no event was published");
-
-    let topics_val: Val = topics.into_val(env);
-    let topics = match xdr::ScVal::try_from_val(env, &topics_val).unwrap() {
-        xdr::ScVal::Vec(Some(topics)) => topics.0,
-        _ => unreachable!("event topics always encode as a vector"),
-    };
-    let data = xdr::ScVal::try_from_val(env, &data).unwrap();
-
-    let expected = xdr::ContractEvent {
-        ext: xdr::ExtensionPoint::V0,
-        type_: xdr::ContractEventType::Contract,
-        contract_id: last.contract_id.clone(),
-        body: xdr::ContractEventBody::V0(xdr::ContractEventV0 { topics, data }),
-    };
-    assert_eq!(last, &expected);
-}
+use soroban_sdk::{vec, IntoVal, Symbol, Val, Vec};
 
 fn setup() -> (Env, NgoRegistryClient<'static>, Address) {
     let env = Env::default();
@@ -82,6 +50,23 @@ fn register_ngo_stores_unverified_entry() {
 }
 
 #[test]
+fn unverified_ngo_can_unregister_and_register_again() {
+    let (env, client, _) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Pending NGO");
+
+    client.register(&owner, &name);
+    client.unregister(&owner);
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+
+    client.register(&owner, &String::from_str(&env, "Updated NGO"));
+    assert_eq!(
+        client.get_ngo(&owner).name,
+        String::from_str(&env, "Updated NGO")
+    );
+}
+
+#[test]
 fn double_register_fails() {
     let (env, client, _admin) = setup();
     let owner = Address::generate(&env);
@@ -91,6 +76,43 @@ fn double_register_fails() {
     let result = client.try_register(&owner, &name);
 
     assert_eq!(result, Err(Ok(Error::AlreadyRegistered)));
+}
+
+#[test]
+fn register_rejects_name_over_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    // MAX_NGO_NAME_LEN (200) + 1 bytes.
+    let too_long = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    let result = client.try_register(&owner, &too_long);
+
+    assert_eq!(result, Err(Ok(Error::NameTooLong)));
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn register_accepts_name_at_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    // Exactly MAX_NGO_NAME_LEN (200) bytes.
+    let at_limit = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    client.register(&owner, &at_limit);
+
+    assert_eq!(client.get_ngo(&owner).name, at_limit);
+}
+
+#[test]
+fn update_name_rejects_name_over_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    let too_long = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    let result = client.try_update_name(&owner, &too_long);
+
+    assert_eq!(result, Err(Ok(Error::NameTooLong)));
 }
 
 #[test]
@@ -116,6 +138,20 @@ fn approve_ngo_marks_verified() {
 }
 
 #[test]
+fn approve_ngo_twice_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+    client.register(&owner, &name);
+
+    client.approve_ngo(&owner);
+
+    let result = client.try_approve_ngo(&owner);
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    assert!(client.get_ngo(&owner).verified);
+}
+
+#[test]
 fn approve_unregistered_ngo_fails() {
     let (env, client, _admin) = setup();
     let random = Address::generate(&env);
@@ -138,6 +174,18 @@ fn revoke_ngo_clears_verified_status() {
 
     let ngo = client.get_ngo(&owner);
     assert!(!ngo.verified);
+}
+
+#[test]
+fn revoke_unverified_ngo_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+    client.register(&owner, &name);
+
+    let result = client.try_revoke_ngo(&owner);
+    assert_eq!(result, Err(Ok(Error::NotVerified)));
+    assert!(!client.get_ngo(&owner).verified);
 }
 
 #[test]
@@ -244,10 +292,29 @@ fn update_name_changes_name_before_approval() {
     let fixed = String::from_str(&env, "Red Cross");
     client.update_name(&owner, &fixed);
 
-    assert_last_event(
+    // Events cover only the latest top-level call, so read them before
+    // `get_ngo` below replaces them.
+    let events = env.events().all();
+    let expected: Vec<(Address, Vec<Val>, Val)> = vec![
         &env,
-        (symbol_short!("renamed"), owner.clone()).into_val(&env),
-        fixed.clone().into_val(&env),
+        (
+            client.address.clone(),
+            (symbol_short!("renamed"), owner.clone()).into_val(&env),
+            fixed.into_val(&env),
+        ),
+    ];
+    assert_eq!(events, expected);
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("renamed"), owner.clone()).into_val(&env),
+                fixed.into_val(&env)
+            ),
+        ]
     );
 
     assert_eq!(
@@ -325,4 +392,72 @@ fn touch_ngo_bumps_instance_and_ngo_ttl() {
     client.touch_ngo(&owner);
 
     assert_ttls_bumped(&env, &client, &owner);
+}
+
+// --- Event assertion tests (issue #62) ---
+
+#[test]
+fn register_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Red Cross");
+
+    client.register(&owner, &name);
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("register"), owner).into_val(&env),
+                name.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn approve_ngo_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.approve_ngo(&owner);
+
+    // Events are cleared per top-level call; only the approved event is visible.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn revoke_ngo_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+
+    client.revoke_ngo(&owner);
+
+    // Events are cleared per top-level call; only the revoked event is visible.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("revoked"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
 }
