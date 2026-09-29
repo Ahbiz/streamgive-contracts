@@ -189,9 +189,14 @@ fn compute_fee(env: &Env, amount: i128) -> i128 {
 /// Pays `amount` out to the NGO, skimming a protocol fee to the treasury
 /// first if one is configured. With no treasury set, the full amount goes
 /// to the NGO regardless of `fee_bps` — there's nowhere to send a fee.
-fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128) {
+///
+/// Returns the net amount actually transferred to the NGO. This is the
+/// single place the fee split is computed, so callers that report the
+/// payout to their own callers (`withdraw`) can return exactly what the
+/// NGO received rather than recomputing the fee and risking drift.
+fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128) -> i128 {
     if amount <= 0 {
-        return;
+        return 0;
     }
 
     let fee = compute_fee(env, amount);
@@ -206,6 +211,8 @@ fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128)
             token_client.transfer(&env.current_contract_address(), &treasury, &fee);
         }
     }
+
+    net
 }
 
 /// Settles the accrual accumulated since the stream's last checkpoint.
@@ -782,7 +789,9 @@ impl DonationVault {
 
     /// Sets the protocol fee, in basis points, taken out of accrued payouts
     /// to the NGO. Admin-gated, capped at `MAX_FEE_BPS`. Has no effect
-    /// unless a treasury is also set.
+    /// unless a treasury is also set. Emits a `feeset` event carrying the
+    /// new value so an off-chain indexer can track fee changes without
+    /// polling `fee_bps`.
     ///
     /// # Examples
     ///
@@ -809,6 +818,9 @@ impl DonationVault {
         }
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         extend_instance_ttl(&env);
+
+        env.events().publish((symbol_short!("feeset"),), fee_bps);
+
         Ok(())
     }
 
@@ -1023,6 +1035,12 @@ impl DonationVault {
     /// Pays out everything accrued to the NGO since the last checkpoint.
     /// NGO-auth-gated.
     ///
+    /// Returns the net amount the NGO actually receives: the gross accrued
+    /// amount minus any protocol fee routed to the treasury. With no
+    /// treasury configured, or when the fee rounds down to zero, that equals
+    /// the full accrued amount. The stream's `withdrawn` bookkeeping and the
+    /// `withdraw` event still report the gross accrued value.
+    ///
     /// # Examples
     ///
     /// ```rust,no_run
@@ -1045,6 +1063,8 @@ impl DonationVault {
     /// // 50 seconds pass -> 10/s * 50 = 500 has accrued.
     /// env.ledger().with_mut(|l| l.timestamp += 50);
     ///
+    /// // No treasury is configured here, so the return value is the full
+    /// // accrued amount. With a fee configured it would be net of that fee.
     /// let withdrawn = client.withdraw(&stream_id);
     /// assert_eq!(withdrawn, 500);
     /// ```
@@ -1075,12 +1095,12 @@ impl DonationVault {
         extend_stream_ttl(&env, stream_id);
 
         let token_client = token::Client::new(&env, &stream.token);
-        pay_ngo(&env, &token_client, &stream.ngo, accrued);
+        let net = pay_ngo(&env, &token_client, &stream.ngo, accrued);
 
         env.events()
             .publish((symbol_short!("withdraw"), stream_id), accrued);
 
-        Ok(accrued)
+        Ok(net)
     }
 
     /// Stops a stream for good: settles whatever has already accrued to the

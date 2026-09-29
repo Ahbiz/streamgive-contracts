@@ -121,7 +121,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     // `last_event` only sees the latest top-level call, so assert it before
     // any other call (such as a balance read) replaces it.
     assert_eq!(
-        last_event(&s.env),
+        created,
         (
             (symbol_short!("created"), stream_id).into_val(&s.env),
             (
@@ -142,9 +142,10 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     s.env.ledger().with_mut(|l| l.timestamp += 50);
 
     let withdrawn = s.client.withdraw(&stream_id);
+    let withdrew = last_event(&s.env);
     assert_eq!(withdrawn, 500);
     assert_eq!(
-        last_event(&s.env),
+        withdrew,
         (
             (symbol_short!("withdraw"), stream_id).into_val(&s.env),
             500i128.into_val(&s.env),
@@ -162,7 +163,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     let refund = s.client.cancel_stream(&stream_id);
     assert_eq!(refund, 300);
     assert_eq!(
-        last_event(&s.env),
+        cancelled,
         (
             (symbol_short!("cancel"), stream_id).into_val(&s.env),
             (200i128, 300i128).into_val(&s.env),
@@ -261,9 +262,10 @@ fn top_up_and_modify_rate_settle_before_changing() {
     s.env.ledger().with_mut(|l| l.timestamp += 10); // 100 accrues
 
     s.client.top_up(&stream_id, &500);
+    let topped_up = last_event(&s.env);
 
     assert_eq!(
-        last_event(&s.env),
+        topped_up,
         (
             (symbol_short!("topup"), stream_id).into_val(&s.env),
             500i128.into_val(&s.env),
@@ -277,9 +279,10 @@ fn top_up_and_modify_rate_settle_before_changing() {
     s.env.ledger().with_mut(|l| l.timestamp += 5); // 50 more accrues at the old rate
 
     s.client.modify_rate(&stream_id, &20);
+    let rate_changed = last_event(&s.env);
 
     assert_eq!(
-        last_event(&s.env),
+        rate_changed,
         (
             (symbol_short!("ratemod"), stream_id).into_val(&s.env),
             (10i128, 20i128).into_val(&s.env),
@@ -370,7 +373,7 @@ fn propose_then_accept_admin_transfers_control() {
 
     s.client.propose_admin(&new_admin);
     assert_eq!(
-        last_event(&s.env),
+        proposed,
         (
             (symbol_short!("propadmin"),).into_val(&s.env),
             new_admin.into_val(&s.env),
@@ -381,7 +384,7 @@ fn propose_then_accept_admin_transfers_control() {
 
     s.client.accept_admin();
     assert_eq!(
-        last_event(&s.env),
+        accepted,
         (
             (symbol_short!("acptadmin"),).into_val(&s.env),
             new_admin.into_val(&s.env),
@@ -540,7 +543,7 @@ fn pause_blocks_create_but_not_cancel() {
 
     s.client.pause();
     assert_eq!(
-        last_event(&s.env),
+        paused_evt,
         (
             (symbol_short!("pause"),).into_val(&s.env),
             ().into_val(&s.env),
@@ -598,7 +601,7 @@ fn unpause_restores_normal_operation() {
     s.client.pause();
     s.client.unpause();
     assert_eq!(
-        last_event(&s.env),
+        unpaused_evt,
         (
             (symbol_short!("unpause"),).into_val(&s.env),
             ().into_val(&s.env),
@@ -694,12 +697,40 @@ fn withdraw_splits_protocol_fee_to_treasury() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let withdrawn = s.client.withdraw(&stream_id);
-    assert_eq!(withdrawn, 500);
+    // The return value is the net payout — the 500 that accrued minus the
+    // 5% (25) sent to the treasury — not the gross accrued amount.
+    assert_eq!(withdrawn, 475);
     assert_eq!(s.token.balance(&treasury), 25);
     assert_eq!(s.token.balance(&s.ngo), 475);
 
     let stream = s.client.get_stream(&stream_id);
-    assert_eq!(stream.withdrawn, 500); // bookkeeping tracks the gross amount
+    assert_eq!(stream.withdrawn, 500); // bookkeeping still tracks the gross amount
+}
+
+#[test]
+fn withdraw_returns_net_after_protocol_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&250); // 2.5%
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 40); // 400 accrues
+
+    let ngo_before = s.token.balance(&s.ngo);
+    let withdrawn = s.client.withdraw(&stream_id);
+
+    // The return value is exactly what the NGO received: 400 gross - 10 fee.
+    assert_eq!(withdrawn, 390);
+    assert_eq!(s.token.balance(&s.ngo) - ngo_before, withdrawn);
+    assert_eq!(s.token.balance(&treasury), 10);
+
+    // And the stream's bookkeeping still records the gross 400 as withdrawn.
+    assert_eq!(s.client.get_stream(&stream_id).withdrawn, 400);
 }
 
 #[test]
@@ -747,6 +778,7 @@ fn small_payout_rounds_protocol_fee_down_to_zero() {
     s.env.ledger().with_mut(|l| l.timestamp += 1); // 19 accrues
 
     let withdrawn = s.client.withdraw(&stream_id);
+    // The fee truncates to zero, so the net return equals the gross here.
     assert_eq!(withdrawn, 19);
 
     // The rounding favours the NGO: it keeps the whole payout rather than
@@ -775,7 +807,8 @@ fn protocol_fee_becomes_nonzero_at_the_rounding_boundary() {
     s.env.ledger().with_mut(|l| l.timestamp += 1); // 20 accrues
 
     let withdrawn = s.client.withdraw(&stream_id);
-    assert_eq!(withdrawn, 20);
+    // 20 gross - 1 fee: the return is net, unlike the 20 recorded as withdrawn.
+    assert_eq!(withdrawn, 19);
     assert_eq!(s.token.balance(&treasury), 1);
     assert_eq!(s.token.balance(&s.ngo), 19);
 }
