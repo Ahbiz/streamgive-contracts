@@ -123,6 +123,20 @@ with `FeeTooHigh` and emit nothing. The event carries the full new value
 once a treasury is set, so pair this with `set_treasury`/`treasury()` when
 deriving an actual split.
 
+### `treasset`
+
+Emitted by `set_treasury` when an admin changes where protocol fees are paid.
+
+| | |
+|---|---|
+| Topics | `("treasset",)` |
+| Data | `treasury: Address` (the new treasury address) |
+
+The event carries the new treasury address so an off-chain indexer can track
+where protocol fees will flow without polling `treasury()`. Protocol fees only
+affect payouts once a treasury is configured, so pair this with `feeset`/`fee_bps()`
+when deriving an actual split.
+
 ### `created`
 
 Emitted by `create_stream` when a donor opens a new stream.
