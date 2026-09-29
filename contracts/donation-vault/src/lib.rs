@@ -14,6 +14,8 @@ use soroban_sdk::{
 
 mod math;
 
+use ngo_registry::NgoRegistryClient;
+
 /// A single donor -> NGO streaming donation.
 ///
 /// `balance` is the undrawn amount still deposited in the vault; `rate` is
@@ -958,6 +960,23 @@ impl DonationVault {
         }
         if deposit < Self::min_deposit(env.clone()) {
             return Err(Error::DepositTooLow);
+        }
+
+        // If a registry has been configured, verify the NGO is approved before
+        // pulling any funds from the donor.
+        if let Some(registry_addr) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Registry)
+        {
+            let registry = NgoRegistryClient::new(&env, &registry_addr);
+            let ngo_entry = registry
+                .try_get_ngo(&ngo)
+                .map_err(|_| Error::NgoNotVerified)?
+                .map_err(|_| Error::NgoNotVerified)?;
+            if !ngo_entry.verified {
+                return Err(Error::NgoNotVerified);
+            }
         }
 
         let token_client = token::Client::new(&env, &token);
