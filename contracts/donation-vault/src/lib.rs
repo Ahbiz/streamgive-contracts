@@ -1130,8 +1130,14 @@ impl DonationVault {
             .unwrap_or(0);
         extend_cancelled_stream_ttl(&env, stream_id, grace_ledgers)?;
 
-        env.events()
-            .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
+        // Only emit the cancel event when something actually moved. When
+        // both values are zero the stream was already cancelled — emitting
+        // here would produce a duplicate that an indexer can't distinguish
+        // from a real cancellation (see issue #91).
+        if accrued > 0 || refund > 0 {
+            env.events()
+                .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
+        }
 
         Ok(refund)
     }

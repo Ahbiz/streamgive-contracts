@@ -45,6 +45,17 @@ fn last_event(env: &Env) -> LastEvent {
     }
 }
 
+/// The number of events emitted by `contract`. Filters by contract address
+/// so token transfers firing inside the same invocation don't inflate the
+/// count, and only covers the most recent invocation.
+fn event_count(env: &Env, contract: &Address) -> usize {
+    env.events()
+        .all()
+        .filter_by_contract(contract)
+        .events()
+        .len()
+}
+
 fn create_token<'a>(env: &Env, admin: &Address) -> (TokenClient<'a>, StellarAssetClient<'a>) {
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
     (
@@ -917,6 +928,11 @@ fn cancel_stream_twice_is_harmless() {
     let refund = s.client.cancel_stream(&stream_id);
     assert_eq!(refund, 0);
 
+    // Sampled here, before any further SDK call: `events().all()` only covers
+    // the most recent invocation, so reading a balance or the stream below
+    // would reset the buffer and make the comparison below vacuous.
+    let events_after_second_cancel = event_count(&s.env, &s.client.address);
+
     assert_eq!(s.token.balance(&s.ngo), 500);
     assert_eq!(s.token.balance(&s.donor), 500);
 
@@ -925,6 +941,14 @@ fn cancel_stream_twice_is_harmless() {
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 500);
     assert!(stream.cancelled);
+
+    // accrued and refund were both zero, so the second cancel must publish
+    // nothing. A duplicate cancel event is indistinguishable from a real
+    // cancellation to an indexer watching the topic (issue #91).
+    assert_eq!(
+        events_after_second_cancel, 0,
+        "a duplicate cancel event was emitted for an already-cancelled stream"
+    );
 }
 
 #[test]
