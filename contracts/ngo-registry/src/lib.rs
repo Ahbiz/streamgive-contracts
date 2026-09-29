@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![no_std]
 // soroban-sdk 27 deprecates Events::publish in favour of the
 // #[contractevent] macro. Migrating is not a lint cleanup: #[contractevent]
@@ -22,7 +23,7 @@ pub struct Ngo {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
     Ngo(Address),
@@ -39,7 +40,17 @@ pub enum Error {
     NotRegistered = 4,
     /// The NGO has already been approved, so its name is locked.
     AlreadyVerified = 5,
+    /// `name` is longer than `MAX_NGO_NAME_LEN`.
+    NameTooLong = 6,
+    /// The NGO has not been approved, so it cannot be revoked.
+    NotVerified = 7,
 }
+
+/// Upper bound on `Ngo.name`, in bytes. Persistent storage cost scales with
+/// what's stored, so without a cap a registration could inflate its own
+/// entry's storage footprint indefinitely. Comfortably fits a real
+/// organization name while keeping a single entry's storage bounded.
+const MAX_NGO_NAME_LEN: u32 = 200;
 
 /// Approximate ledgers per day at a 5-second close time. Used to express
 /// storage TTLs (which the network counts in ledgers, not wall time) in
@@ -157,6 +168,10 @@ impl NgoRegistry {
     pub fn register(env: Env, owner: Address, name: String) -> Result<(), Error> {
         owner.require_auth();
 
+        if name.len() > MAX_NGO_NAME_LEN {
+            return Err(Error::NameTooLong);
+        }
+
         let key = DataKey::Ngo(owner.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyRegistered);
@@ -187,6 +202,30 @@ impl NgoRegistry {
         Ok(())
     }
 
+    /// Removes the caller's unverified NGO application.
+    ///
+    /// Verified registrations are intentionally permanent until an admin
+    /// revokes verification.
+    pub fn unregister(env: Env, owner: Address) -> Result<(), Error> {
+        owner.require_auth();
+
+        let key = DataKey::Ngo(owner.clone());
+        let ngo: Ngo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotRegistered)?;
+        if ngo.verified {
+            return Err(Error::AlreadyVerified);
+        }
+
+        env.storage().persistent().remove(&key);
+        extend_instance_ttl(&env);
+        env.events().publish((symbol_short!("unregist"), owner), ());
+
+        Ok(())
+    }
+
     /// Changes the name on an NGO's own pending application, so a typo or
     /// rename can be fixed without going through an admin. Requires the
     /// owner's auth. Fails with `Error::NotRegistered` for an address with
@@ -213,6 +252,10 @@ impl NgoRegistry {
     /// ```
     pub fn update_name(env: Env, owner: Address, name: String) -> Result<(), Error> {
         owner.require_auth();
+
+        if name.len() > MAX_NGO_NAME_LEN {
+            return Err(Error::NameTooLong);
+        }
 
         let key = DataKey::Ngo(owner.clone());
         let mut ngo: Ngo = env
@@ -292,7 +335,10 @@ impl NgoRegistry {
             .unwrap_or(0)
     }
 
-    /// Marks a registered NGO as verified. Admin-only.
+    /// Marks a registered NGO as verified. Admin-only. Fails with
+    /// `Error::AlreadyVerified` if the NGO is already verified, so a
+    /// repeated call can't rewrite the entry or publish a duplicate
+    /// `approved` event.
     ///
     /// # Examples
     ///
@@ -320,6 +366,9 @@ impl NgoRegistry {
             .persistent()
             .get(&key)
             .ok_or(Error::NotRegistered)?;
+        if ngo.verified {
+            return Err(Error::AlreadyVerified);
+        }
         ngo.verified = true;
         env.storage().persistent().set(&key, &ngo);
         extend_instance_ttl(&env);
@@ -333,7 +382,9 @@ impl NgoRegistry {
 
     /// Reverses a prior approval, marking a registered NGO as unverified
     /// again. Admin-only. Returns `Error::NotRegistered` for an address
-    /// with no entry, matching `approve_ngo`'s existing behavior.
+    /// with no entry, matching `approve_ngo`'s existing behavior, and
+    /// `Error::NotVerified` if the NGO isn't currently verified, so a
+    /// repeated call can't publish a duplicate `revoked` event.
     ///
     /// # Examples
     ///
@@ -362,6 +413,9 @@ impl NgoRegistry {
             .persistent()
             .get(&key)
             .ok_or(Error::NotRegistered)?;
+        if !ngo.verified {
+            return Err(Error::NotVerified);
+        }
         ngo.verified = false;
         env.storage().persistent().set(&key, &ngo);
         extend_instance_ttl(&env);
