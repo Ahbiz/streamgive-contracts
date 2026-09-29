@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![no_std]
 // soroban-sdk 27 deprecates Events::publish in favour of the
 // #[contractevent] macro. Migrating is not a lint cleanup: #[contractevent]
@@ -33,10 +34,14 @@ pub struct Stream {
     pub withdrawn: i128,
     pub created_at: u64,
     pub last_update: u64,
+    /// Set once by `cancel_stream`, never unset. Distinguishes a cancelled
+    /// stream (`rate == 0`, `balance == 0`) from one that simply ran dry
+    /// and was withdrawn in full (`balance == 0` but `rate` unchanged).
+    pub cancelled: bool,
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
     PendingAdmin,
@@ -45,6 +50,8 @@ pub enum DataKey {
     Paused,
     Treasury,
     FeeBps,
+    MinDeposit,
+    CancelGraceLedgers,
 }
 
 #[contracterror]
@@ -63,6 +70,12 @@ pub enum Error {
     /// leave its type's range. Returned instead of letting the release
     /// profile's overflow checks panic and abort the transaction.
     ArithmeticOverflow = 9,
+    /// `deposit` was below the configured `min_deposit`.
+    DepositTooLow = 10,
+    AlreadyPaused = 11,
+    AlreadyUnpaused = 12,
+    SelfStream = 13,
+    StreamCancelled = 14,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -97,6 +110,20 @@ fn extend_stream_ttl(env: &Env, stream_id: u64) {
         STREAM_LIFETIME_THRESHOLD,
         STREAM_BUMP_AMOUNT,
     );
+}
+
+/// Extends a cancelled stream beyond the normal retention period by the
+/// configured indexing grace period.
+fn extend_cancelled_stream_ttl(env: &Env, stream_id: u64, grace_ledgers: u32) -> Result<(), Error> {
+    let bump_amount = STREAM_BUMP_AMOUNT
+        .checked_add(grace_ledgers)
+        .ok_or(Error::ArithmeticOverflow)?;
+    env.storage().persistent().extend_ttl(
+        &DataKey::Stream(stream_id),
+        STREAM_LIFETIME_THRESHOLD,
+        bump_amount,
+    );
+    Ok(())
 }
 
 /// Reads the configured admin and requires their auth, failing with
@@ -142,6 +169,21 @@ fn record_payout(stream: &mut Stream, amount: i128) -> Result<(), Error> {
     Ok(())
 }
 
+/// Returns the protocol fee that would be taken on `amount`, using the same
+/// logic as `pay_ngo`. Zero when no treasury is configured, regardless of
+/// `fee_bps` — there's nowhere to send a fee without a destination address.
+/// Rounds toward zero (the NGO never loses a unit to rounding).
+fn compute_fee(env: &Env, amount: i128) -> i128 {
+    let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+    match treasury {
+        Some(_) => {
+            let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+            (amount.saturating_mul(fee_bps as i128) / 10_000).min(amount)
+        }
+        None => 0,
+    }
+}
+
 /// Pays `amount` out to the NGO, skimming a protocol fee to the treasury
 /// first if one is configured. With no treasury set, the full amount goes
 /// to the NGO regardless of `fee_bps` — there's nowhere to send a fee.
@@ -150,24 +192,36 @@ fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128)
         return;
     }
 
-    let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
-    let fee = match &treasury {
-        Some(_) => {
-            let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
-            (amount.saturating_mul(fee_bps as i128) / 10_000).min(amount)
-        }
-        None => 0,
-    };
+    let fee = compute_fee(env, amount);
     let net = amount - fee;
 
     if net > 0 {
         token_client.transfer(&env.current_contract_address(), ngo, &net);
     }
     if fee > 0 {
+        let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
         if let Some(treasury) = treasury {
             token_client.transfer(&env.current_contract_address(), &treasury, &fee);
         }
     }
+}
+
+/// Settles the accrual accumulated since the stream's last checkpoint.
+///
+/// This is shared by every operation that changes a stream's balance or rate
+/// so payout accounting, checked arithmetic, and the checkpoint timestamp
+/// cannot drift between entry points.
+fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
+    let elapsed = now.saturating_sub(stream.last_update);
+    let accrued = math::accrued(stream.rate, elapsed, stream.balance);
+    let token_client = token::Client::new(env, &stream.token);
+
+    if accrued > 0 {
+        pay_ngo(env, &token_client, &stream.ngo, accrued);
+        record_payout(stream, accrued)?;
+    }
+    stream.last_update = now;
+    Ok(accrued)
 }
 
 #[contract]
@@ -197,6 +251,10 @@ impl DonationVault {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextStreamId, &0u64);
+        env.storage().instance().set(&DataKey::MinDeposit, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::CancelGraceLedgers, &0u32);
         extend_instance_ttl(&env);
         Ok(())
     }
@@ -384,6 +442,12 @@ impl DonationVault {
     /// let stream = client.get_stream(&stream_id);
     /// assert_eq!(stream.balance, 1_000);
     /// assert_eq!(stream.rate, 10);
+    /// assert!(!stream.cancelled);
+    ///
+    /// // Once cancelled, `cancelled` stays true even though a drained
+    /// // (fully withdrawn) stream would also show `rate == 0 && balance == 0`.
+    /// client.cancel_stream(&stream_id);
+    /// assert!(client.get_stream(&stream_id).cancelled);
     /// ```
     pub fn get_stream(env: Env, stream_id: u64) -> Result<Stream, Error> {
         env.storage()
@@ -477,11 +541,20 @@ impl DonationVault {
     /// Returns `None` when the stream will never deplete: a cancelled or
     /// zero-rate stream, or a timestamp too far out to represent. An already
     /// empty stream that still has a rate returns its `last_update`.
+    /// Read-only view of the net amount the NGO would actually receive and the
+    /// fee that would be taken if `withdraw` were called right now.
+    ///
+    /// Unlike `pending_accrual`, which returns the gross accrued amount, this
+    /// accounts for any configured treasury fee, so a UI can show the correct
+    /// "you will receive X" figure rather than overstating it.
+    ///
+    /// Never mutates storage or moves funds.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// # use soroban_sdk::{testutils::Address as _, token, Address, Env};
+    /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
     /// # use donation_vault::{DonationVault, DonationVaultClient};
     /// # let env = Env::default();
     /// # env.mock_all_auths();
@@ -505,6 +578,18 @@ impl DonationVault {
     /// assert_eq!(client.depletion_time(&stream_id), None);
     /// ```
     pub fn depletion_time(env: Env, stream_id: u64) -> Result<Option<u64>, Error> {
+    /// let treasury = Address::generate(&env);
+    /// client.set_treasury(&treasury);
+    /// client.set_fee_bps(&500); // 5%
+    ///
+    /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+    ///
+    /// let (net, fee) = client.pending_payout(&stream_id);
+    /// assert_eq!(fee, 25);   // 5% of 500
+    /// assert_eq!(net, 475);  // 500 - 25
+    /// ```
+    pub fn pending_payout(env: Env, stream_id: u64) -> Result<(i128, i128), Error> {
         let stream: Stream = env
             .storage()
             .persistent()
@@ -513,6 +598,11 @@ impl DonationVault {
 
         Ok(math::seconds_to_deplete(stream.rate, stream.balance)
             .and_then(|seconds| stream.last_update.checked_add(seconds)))
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(stream.last_update);
+        let gross = math::accrued(stream.rate, elapsed, stream.balance);
+        let fee = compute_fee(&env, gross);
+        Ok((gross - fee, fee))
     }
 
     /// Bumps a stream's persistent-storage TTL without touching its state.
@@ -570,6 +660,14 @@ impl DonationVault {
     /// ```
     pub fn pause(env: Env) -> Result<(), Error> {
         require_admin(&env)?;
+        let already_paused = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false);
+        if already_paused {
+            return Err(Error::AlreadyPaused);
+        }
         env.storage().instance().set(&DataKey::Paused, &true);
         extend_instance_ttl(&env);
         env.events().publish((symbol_short!("pause"),), ());
@@ -595,6 +693,14 @@ impl DonationVault {
     /// ```
     pub fn unpause(env: Env) -> Result<(), Error> {
         require_admin(&env)?;
+        let already_unpaused = !env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false);
+        if already_unpaused {
+            return Err(Error::AlreadyUnpaused);
+        }
         env.storage().instance().set(&DataKey::Paused, &false);
         extend_instance_ttl(&env);
         env.events().publish((symbol_short!("unpause"),), ());
@@ -666,6 +772,36 @@ impl DonationVault {
         env.storage().instance().get(&DataKey::Treasury)
     }
 
+    /// Removes the configured treasury so protocol fees are no longer collected.
+    /// After this call `treasury()` returns `None` and `pay_ngo` sends the full
+    /// payout directly to the NGO, the same as if a treasury had never been set.
+    /// Admin-gated.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// let treasury = Address::generate(&env);
+    /// client.set_treasury(&treasury);
+    /// assert_eq!(client.treasury(), Some(treasury));
+    ///
+    /// client.clear_treasury();
+    /// assert_eq!(client.treasury(), None);
+    /// ```
+    pub fn clear_treasury(env: Env) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage().instance().remove(&DataKey::Treasury);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
     /// Sets the protocol fee, in basis points, taken out of accrued payouts
     /// to the NGO. Admin-gated, capped at `MAX_FEE_BPS`. Has no effect
     /// unless a treasury is also set.
@@ -717,14 +853,91 @@ impl DonationVault {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
+    /// Sets the minimum `deposit` accepted by `create_stream`, letting an
+    /// operator filter out dust streams without changing application-level
+    /// validation on every frontend that talks to the contract. Admin-gated.
+    /// Defaults to `0` (today's behavior) until set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// client.set_min_deposit(&100);
+    /// assert_eq!(client.min_deposit(), 100);
+    /// ```
+    pub fn set_min_deposit(env: Env, min_deposit: i128) -> Result<(), Error> {
+        require_admin(&env)?;
+        if min_deposit < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinDeposit, &min_deposit);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Reads back the configured minimum deposit. `0` until an admin sets
+    /// one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// assert_eq!(client.min_deposit(), 0);
+    /// ```
+    pub fn min_deposit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinDeposit)
+            .unwrap_or(0)
+    }
+
+    /// Sets how many additional ledgers a cancelled stream remains available
+    /// for indexers after the normal stream-retention period. Admin-only.
+    pub fn set_cancel_grace_ledgers(env: Env, grace_ledgers: u32) -> Result<(), Error> {
+        require_admin(&env)?;
+        STREAM_BUMP_AMOUNT
+            .checked_add(grace_ledgers)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::CancelGraceLedgers, &grace_ledgers);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Returns the configured cancelled-stream indexing grace period.
+    pub fn cancel_grace_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CancelGraceLedgers)
+            .unwrap_or(0)
+    }
+
     /// Opens a new stream: pulls `deposit` of `token` from the donor into the
     /// vault, to be released to the NGO at `rate` per second on withdrawal.
+    /// `donor` and `ngo` must be distinct addresses.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// # use soroban_sdk::{testutils::Address as _, token, Address, Env};
-    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # use donation_vault::{DonationVault, DonationVaultClient, Error};
     /// # let env = Env::default();
     /// # env.mock_all_auths();
     /// # let contract_id = env.register(DonationVault, ());
@@ -740,6 +953,11 @@ impl DonationVault {
     /// // Stream 1_000 units of the token to `ngo` at 10 units/second.
     /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
     /// assert_eq!(client.get_stream(&stream_id).balance, 1_000);
+    ///
+    /// // A stream needs two distinct parties — the vault refuses to pay a
+    /// // donor back their own deposit.
+    /// let result = client.try_create_stream(&donor, &donor, &sac.address(), &1_000, &10);
+    /// assert_eq!(result, Err(Ok(Error::SelfStream)));
     /// ```
     pub fn create_stream(
         env: Env,
@@ -752,8 +970,18 @@ impl DonationVault {
         require_not_paused(&env)?;
         donor.require_auth();
 
+        // Checked before the deposit is pulled and before the amounts are
+        // validated: a self-stream is never a legitimate call regardless of
+        // how the other arguments look, and it must not reach the transfer.
+        if donor == ngo {
+            return Err(Error::SelfStream);
+        }
+
         if deposit <= 0 || rate <= 0 {
             return Err(Error::InvalidAmount);
+        }
+        if deposit < Self::min_deposit(env.clone()) {
+            return Err(Error::DepositTooLow);
         }
 
         let token_client = token::Client::new(&env, &token);
@@ -775,14 +1003,13 @@ impl DonationVault {
             withdrawn: 0,
             created_at: now,
             last_update: now,
+            cancelled: false,
         };
 
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
-        let next_stream_id = stream_id
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
+        let next_stream_id = stream_id.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         env.storage()
             .instance()
             .set(&DataKey::NextStreamId, &next_stream_id);
@@ -889,10 +1116,12 @@ impl DonationVault {
     ///
     /// // Settles the 200 already accrued to the NGO, refunds the
     /// // untouched 800 to the donor, and zeroes the stream out.
-    /// client.cancel_stream(&stream_id);
+    /// let refund = client.cancel_stream(&stream_id);
+    /// assert_eq!(refund, 800);
     /// assert_eq!(client.get_stream(&stream_id).balance, 0);
+    /// assert!(client.get_stream(&stream_id).cancelled);
     /// ```
-    pub fn cancel_stream(env: Env, stream_id: u64) -> Result<(), Error> {
+    pub fn cancel_stream(env: Env, stream_id: u64) -> Result<i128, Error> {
         let key = DataKey::Stream(stream_id);
         let mut stream: Stream = env
             .storage()
@@ -903,15 +1132,9 @@ impl DonationVault {
         stream.donor.require_auth();
 
         let now = env.ledger().timestamp();
-        let elapsed = now.saturating_sub(stream.last_update);
-        let accrued = math::accrued(stream.rate, elapsed, stream.balance);
+        let accrued = settle(&env, &mut stream, now)?;
 
         let token_client = token::Client::new(&env, &stream.token);
-
-        if accrued > 0 {
-            pay_ngo(&env, &token_client, &stream.ngo, accrued);
-            record_payout(&mut stream, accrued)?;
-        }
 
         let refund = stream.balance;
         if refund > 0 {
@@ -920,20 +1143,34 @@ impl DonationVault {
 
         stream.balance = 0;
         stream.rate = 0;
+        stream.cancelled = true;
         stream.last_update = now;
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
-        extend_stream_ttl(&env, stream_id);
+        let grace_ledgers = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancelGraceLedgers)
+            .unwrap_or(0);
+        extend_cancelled_stream_ttl(&env, stream_id, grace_ledgers)?;
 
-        env.events()
-            .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
+        // Only emit the cancel event when something actually moved. When
+        // both values are zero the stream was already cancelled — emitting
+        // here would produce a duplicate that an indexer can't distinguish
+        // from a real cancellation (see issue #91).
+        if accrued > 0 || refund > 0 {
+            env.events()
+                .publish((symbol_short!("cancel"), stream_id), (accrued, refund));
+        }
 
-        Ok(())
+        Ok(refund)
     }
 
     /// Adds more funds to an existing stream. Donor-auth-gated. Settles
     /// whatever has already accrued to the NGO first, so the top-up only
-    /// ever affects accrual going forward.
+    /// ever affects accrual going forward. Fails with
+    /// `Error::StreamCancelled` if `cancel_stream` has already closed the
+    /// stream out.
     ///
     /// # Examples
     ///
@@ -974,16 +1211,14 @@ impl DonationVault {
 
         stream.donor.require_auth();
 
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
+
         let token_client = token::Client::new(&env, &stream.token);
 
         let now = env.ledger().timestamp();
-        let elapsed = now.saturating_sub(stream.last_update);
-        let accrued = math::accrued(stream.rate, elapsed, stream.balance);
-        if accrued > 0 {
-            pay_ngo(&env, &token_client, &stream.ngo, accrued);
-            record_payout(&mut stream, accrued)?;
-        }
-        stream.last_update = now;
+        let _accrued = settle(&env, &mut stream, now)?;
 
         token_client.transfer(&stream.donor, env.current_contract_address(), &amount);
         stream.balance = stream
@@ -1003,7 +1238,9 @@ impl DonationVault {
 
     /// Changes the per-second accrual rate on an existing stream. Donor-auth-gated.
     /// Settles whatever has already accrued at the old rate first, so the new
-    /// rate only ever applies going forward — never retroactively.
+    /// rate only ever applies going forward — never retroactively. Fails
+    /// with `Error::StreamCancelled` if `cancel_stream` has already closed
+    /// the stream out — otherwise this would quietly revive it.
     ///
     /// # Examples
     ///
@@ -1043,16 +1280,14 @@ impl DonationVault {
             .ok_or(Error::StreamNotFound)?;
 
         stream.donor.require_auth();
+        let old_rate = stream.rate;
+
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
 
         let now = env.ledger().timestamp();
-        let elapsed = now.saturating_sub(stream.last_update);
-        let accrued = math::accrued(stream.rate, elapsed, stream.balance);
-        if accrued > 0 {
-            let token_client = token::Client::new(&env, &stream.token);
-            pay_ngo(&env, &token_client, &stream.ngo, accrued);
-            record_payout(&mut stream, accrued)?;
-        }
-        stream.last_update = now;
+        let _accrued = settle(&env, &mut stream, now)?;
         stream.rate = new_rate;
 
         env.storage().persistent().set(&key, &stream);
@@ -1060,7 +1295,7 @@ impl DonationVault {
         extend_stream_ttl(&env, stream_id);
 
         env.events()
-            .publish((symbol_short!("ratemod"), stream_id), new_rate);
+            .publish((symbol_short!("ratemod"), stream_id), (old_rate, new_rate));
 
         Ok(())
     }
