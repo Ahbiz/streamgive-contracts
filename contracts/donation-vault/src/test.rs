@@ -956,6 +956,25 @@ fn protocol_fee_becomes_nonzero_at_the_rounding_boundary() {
 }
 
 #[test]
+fn get_config_reflects_admin_settings() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.pause();
+
+    assert_eq!(
+        s.client.get_config(),
+        Config {
+            paused: true,
+            treasury: Some(treasury),
+            fee_bps: 500,
+        }
+    );
+}
+
+#[test]
 fn set_fee_bps_rejects_over_cap() {
     let s = setup();
     let result = s.client.try_set_fee_bps(&1_001);

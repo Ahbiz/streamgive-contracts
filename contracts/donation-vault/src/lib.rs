@@ -781,6 +781,19 @@ impl DonationVault {
             .unwrap_or(false)
     }
 
+    /// Reads back all admin-set configuration in one call.
+    pub fn get_config(env: Env) -> Config {
+        Config {
+            paused: env
+                .storage()
+                .instance()
+                .get(&DataKey::Paused)
+                .unwrap_or(false),
+            treasury: env.storage().instance().get(&DataKey::Treasury),
+            fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+        }
+    }
+
     /// Sets where the protocol fee (if any) gets paid. Admin-gated.
     ///
     /// # Examples
