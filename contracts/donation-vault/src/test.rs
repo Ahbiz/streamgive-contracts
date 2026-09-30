@@ -1331,6 +1331,55 @@ fn admin_writes_bump_instance_ttl() {
     assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
 }
 
+#[test]
+fn renounce_admin_clears_admin_and_pending_proposal() {
+    let s = setup();
+    let admin = s.client.admin();
+    let new_admin = Address::generate(&s.env);
+
+    // A pending proposal exists before renouncing.
+    s.client.propose_admin(&new_admin);
+    assert_eq!(s.client.pending_admin(), Some(new_admin.clone()));
+
+    s.client.renounce_admin();
+    assert_auth_required_from(&s, &admin, "renounce_admin");
+
+    // Both the admin and any pending proposal are cleared.
+    assert_eq!(s.client.pending_admin(), None);
+}
+
+#[test]
+fn renounce_admin_disables_admin_gated_calls() {
+    let s = setup();
+    let admin = s.client.admin();
+
+    s.client.renounce_admin();
+    assert_auth_required_from(&s, &admin, "renounce_admin");
+
+    // Admin-gated entry points must now fail cleanly rather than succeed.
+    assert!(s.client.try_pause().is_err());
+    assert!(s.client.try_unpause().is_err());
+    assert!(s.client.try_set_treasury(&Address::generate(&s.env)).is_err());
+    assert!(s.client.try_clear_treasury().is_err());
+    assert!(s.client.try_set_fee_bps(&100).is_err());
+    assert!(s
+        .client
+        .try_propose_admin(&Address::generate(&s.env))
+        .is_err());
+    assert!(s.client.try_cancel_admin_proposal().is_err());
+    assert!(s.client.try_set_min_deposit(&1_000).is_err());
+    assert!(s.client.try_set_max_streams_per_donor(&5).is_err());
+}
+
+#[test]
+fn renounce_admin_without_admin_fails() {
+    let s = setup();
+    s.client.renounce_admin();
+
+    // A second renounce has no admin to authorize it and must fail.
+    assert!(s.client.try_renounce_admin().is_err());
+}
+
 /// Rewrites a stored stream in place, for pushing its bookkeeping to the
 /// edge of i128 — no real token supply could get it there.
 fn overwrite_stream(s: &Setup, stream_id: u64, edit: impl FnOnce(&mut Stream)) {

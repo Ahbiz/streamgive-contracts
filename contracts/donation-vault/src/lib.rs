@@ -117,6 +117,9 @@ pub enum Error {
     StreamCancelled = 14,
     /// The proposed administrator is not a valid replacement.
     InvalidAdmin = 15,
+    /// The admin has renounced control, so admin-gated calls are permanently
+    /// disabled.
+    AdminRenounced = 16,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -313,6 +316,16 @@ impl DonationVault {
         Ok(())
     }
 
+    /// Permanently gives up admin control. Admin-authed.
+    ///
+    /// Clears the stored admin and any pending admin proposal. After this
+    /// call every admin-gated entry point fails with
+    /// `Error::AdminRenounced`, so the admin-gated surface is permanently
+    /// disabled. This cannot be undone.
+    ///
+    /// # Examples
+    ///
+    /// 
     /// Reads back the vault admin set by `init`.
     ///
     /// # Examples
