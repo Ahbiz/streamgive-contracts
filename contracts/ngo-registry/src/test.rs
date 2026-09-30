@@ -343,6 +343,48 @@ fn update_name_after_approval_fails() {
 }
 
 #[test]
+fn update_name_after_revocation_succeeds() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Crsos"));
+    client.approve_ngo(&owner);
+
+    // The name an admin approved is locked only while the NGO stays
+    // verified, so the rename has to be rejected at this point.
+    let blocked = client.try_update_name(&owner, &String::from_str(&env, "Red Cross"));
+    assert_eq!(blocked, Err(Ok(Error::AlreadyVerified)));
+
+    client.revoke_ngo(&owner);
+    assert!(!client.get_ngo(&owner).verified);
+
+    let fixed = String::from_str(&env, "Red Cross");
+    client.update_name(&owner, &fixed);
+
+    // Events cover only the latest top-level call, so read them before
+    // `get_ngo` below replaces them.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("renamed"), owner.clone()).into_val(&env),
+                fixed.clone().into_val(&env),
+            ),
+        ]
+    );
+
+    assert_eq!(
+        client.get_ngo(&owner),
+        Ngo {
+            owner: owner.clone(),
+            name: fixed,
+            verified: false,
+        }
+    );
+}
+
+#[test]
 fn update_name_for_unregistered_ngo_fails() {
     let (env, client, _admin) = setup();
     let random = Address::generate(&env);

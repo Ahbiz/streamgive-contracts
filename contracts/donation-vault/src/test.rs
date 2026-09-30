@@ -418,6 +418,13 @@ fn propose_admin_rejects_current_admin() {
 }
 
 #[test]
+fn allowed_tokens_is_empty_when_unconfigured() {
+    let s = setup();
+
+    assert_eq!(s.client.allowed_tokens().len(), 0);
+}
+
+#[test]
 fn accept_admin_without_proposal_fails() {
     let s = setup();
     let result = s.client.try_accept_admin();
@@ -515,6 +522,123 @@ fn pending_accrual_matches_withdraw_without_mutating_state() {
     // It should match exactly what withdraw actually pays out.
     let withdrawn = s.client.withdraw(&stream_id);
     assert_eq!(withdrawn, pending);
+}
+
+#[test]
+fn depletion_time_is_last_update_plus_balance_over_rate() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let created_at = s.client.get_stream(&stream_id).created_at;
+
+    // 1_000 at 10/s divides evenly: exactly 100 seconds.
+    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 100));
+
+    // Nothing is settled by just asking, and the answer doesn't drift as
+    // time passes without a settlement.
+    s.env.ledger().with_mut(|l| l.timestamp += 30);
+    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 100));
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn depletion_time_rounds_a_partial_final_second_up() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // 1_000 / 300 = 3.33 seconds: three seconds leave 100 unpaid, so the
+    // stream is only empty once the fourth second has run.
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &300);
+    let created_at = s.client.get_stream(&stream_id).created_at;
+    let depletes_at = s.client.depletion_time(&stream_id).unwrap();
+    assert_eq!(depletes_at, created_at + 4);
+
+    // One second short of it, funds are still left...
+    s.env.ledger().with_mut(|l| l.timestamp = depletes_at - 1);
+    assert_eq!(s.client.pending_accrual(&stream_id), 900);
+
+    // ...and at the reported time the whole balance has accrued.
+    s.env.ledger().with_mut(|l| l.timestamp = depletes_at);
+    assert_eq!(s.client.pending_accrual(&stream_id), 1_000);
+}
+
+#[test]
+fn depletion_time_moves_with_a_settlement() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &300);
+
+    // Withdraw after 2 seconds: 600 paid, 400 left, settled at that moment.
+    s.env.ledger().with_mut(|l| l.timestamp += 2);
+    s.client.withdraw(&stream_id);
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 400);
+
+    // 400 / 300 = 1.33 -> 2 more seconds from the new last_update.
+    assert_eq!(
+        s.client.depletion_time(&stream_id),
+        Some(stream.last_update + 2)
+    );
+}
+
+#[test]
+fn depletion_time_of_a_balance_below_the_rate_is_one_second_out() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &5);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &5, &1_000);
+    let created_at = s.client.get_stream(&stream_id).created_at;
+
+    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 1));
+}
+
+#[test]
+fn depletion_time_of_a_drained_stream_is_its_last_update() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 500);
+    s.client.withdraw(&stream_id);
+
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 0);
+    assert_eq!(
+        s.client.depletion_time(&stream_id),
+        Some(stream.last_update)
+    );
+}
+
+#[test]
+fn depletion_time_of_a_cancelled_stream_is_none() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    assert_eq!(s.client.depletion_time(&stream_id), None);
+}
+
+#[test]
+fn depletion_time_on_unknown_stream_fails() {
+    let s = setup();
+    let result = s.client.try_depletion_time(&999);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
 }
 
 #[test]
@@ -842,6 +966,25 @@ fn protocol_fee_becomes_nonzero_at_the_rounding_boundary() {
     assert_eq!(withdrawn, 19);
     assert_eq!(s.token.balance(&treasury), 1);
     assert_eq!(s.token.balance(&s.ngo), 19);
+}
+
+#[test]
+fn get_config_reflects_admin_settings() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.pause();
+
+    assert_eq!(
+        s.client.get_config(),
+        Config {
+            paused: true,
+            treasury: Some(treasury),
+            fee_bps: 500,
+        }
+    );
 }
 
 #[test]
@@ -1335,6 +1478,55 @@ fn admin_writes_bump_instance_ttl() {
     age_past_thresholds(&s, None);
     s.client.accept_admin();
     assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
+}
+
+#[test]
+fn renounce_admin_clears_admin_and_pending_proposal() {
+    let s = setup();
+    let admin = s.client.admin();
+    let new_admin = Address::generate(&s.env);
+
+    // A pending proposal exists before renouncing.
+    s.client.propose_admin(&new_admin);
+    assert_eq!(s.client.pending_admin(), Some(new_admin.clone()));
+
+    s.client.renounce_admin();
+    assert_auth_required_from(&s, &admin, "renounce_admin");
+
+    // Both the admin and any pending proposal are cleared.
+    assert_eq!(s.client.pending_admin(), None);
+}
+
+#[test]
+fn renounce_admin_disables_admin_gated_calls() {
+    let s = setup();
+    let admin = s.client.admin();
+
+    s.client.renounce_admin();
+    assert_auth_required_from(&s, &admin, "renounce_admin");
+
+    // Admin-gated entry points must now fail cleanly rather than succeed.
+    assert!(s.client.try_pause().is_err());
+    assert!(s.client.try_unpause().is_err());
+    assert!(s.client.try_set_treasury(&Address::generate(&s.env)).is_err());
+    assert!(s.client.try_clear_treasury().is_err());
+    assert!(s.client.try_set_fee_bps(&100).is_err());
+    assert!(s
+        .client
+        .try_propose_admin(&Address::generate(&s.env))
+        .is_err());
+    assert!(s.client.try_cancel_admin_proposal().is_err());
+    assert!(s.client.try_set_min_deposit(&1_000).is_err());
+    assert!(s.client.try_set_max_streams_per_donor(&5).is_err());
+}
+
+#[test]
+fn renounce_admin_without_admin_fails() {
+    let s = setup();
+    s.client.renounce_admin();
+
+    // A second renounce has no admin to authorize it and must fail.
+    assert!(s.client.try_renounce_admin().is_err());
 }
 
 /// Rewrites a stored stream in place, for pushing its bookkeeping to the
