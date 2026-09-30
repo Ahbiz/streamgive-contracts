@@ -135,6 +135,35 @@ expire independently of the vault instance, so state-changing calls and the
 permissionless `extend_stream` entry point refresh the specific stream that
 needs to remain available.
 
+**Risk: a long-idle stream can still expire and lock its funds** (issue
+#197). A stream nobody interacts with — a slow trickle where neither the
+donor tops it up nor the NGO withdraws from it, and nobody happens to call
+`extend_stream` — has no interaction to refresh its TTL with. If its
+storage entry is archived, the stream (and the ability to withdraw or
+cancel it) is lost even though funds remain committed to it.
+
+This is mitigated, not eliminated: every TTL bump (on create, withdraw,
+top-up, rate change, or an explicit `extend_stream` call) sizes itself to
+the stream's own remaining lifetime — `balance / rate`, converted to
+ledgers — when that is longer than the normal 90-day default, rather than
+always bumping by the flat default alone. A stream depositing enough to run
+for a year gets close to a year of TTL from that single interaction, not
+just 90 days. Two things this does not solve:
+
+- **It requires at least one interaction to take effect at all.** A stream
+  that has *never* been touched since `create_stream` (which does apply the
+  lifetime-aware bump) is already covered from the start; the residual risk
+  is a stream whose bump was capped below its full remaining lifetime (see
+  the next point) and that then goes untouched for longer than that capped
+  window.
+- **It cannot bump past the network's own maximum entry TTL** (`max_ttl`,
+  read at call time). A stream with a longer remaining lifetime than that
+  ceiling still needs an eventual `extend_stream` call before the ceiling
+  is reached, same as before this mitigation. `extend_stream` remains
+  permissionless specifically so anyone — the donor, the NGO, a keeper
+  bot, or a block explorer's own indexing pass — can perform that refresh
+  without needing any special authorization.
+
 ### What is the cancelled-stream grace period?
 
 The admin can configure `cancel_grace_ledgers` so indexers have additional
