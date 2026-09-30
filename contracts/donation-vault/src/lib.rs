@@ -10,6 +10,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Vec,
 };
 
 mod math;
@@ -70,6 +71,10 @@ pub enum DataKey {
     Paused,
     Treasury,
     FeeBps,
+    /// The token allowlist surfaced to frontend token pickers. See
+    /// [`allowed_tokens`](DonationVault::allowed_tokens); empty until an
+    /// operator configures one.
+    AllowedTokens,
     /// Admin-settable per-donor stream cap. See `set_max_streams_per_donor`.
     MaxStreamsPerDonor,
     /// Count of streams a donor currently has open. Incremented on
@@ -869,6 +874,15 @@ impl DonationVault {
     /// ```
     pub fn fee_bps(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
+    }
+
+    /// Returns the configured token allowlist for frontend token pickers.
+    /// Until an allowlist is configured, this returns an empty vector.
+    pub fn allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Sets the minimum `deposit` accepted by `create_stream`, letting an

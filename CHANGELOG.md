@@ -25,6 +25,7 @@ This project does not yet follow a formal versioning scheme — each contract's
   their zero-rounded protocol fee.
 - `DataKey` enums now derive `Debug` in both contracts for clearer storage-key
   diagnostics.
+- `donation-vault`: read-only `allowed_tokens` getter for frontend token pickers.
 - `donation-vault`: two-step admin transfer via `propose_admin` /
   `accept_admin`.
 - `donation-vault`: reject self-admin proposals with `Error::InvalidAdmin`.
