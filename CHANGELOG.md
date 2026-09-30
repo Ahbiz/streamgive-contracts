@@ -21,6 +21,9 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: admin-configurable `cancel_grace_ledgers` retention for
   cancelled streams, with TTL coverage for indexing after cancellation.
 - `donation-vault`: read-only `pending_accrual` view.
+- `donation-vault`: read-only `streams_by_donor` view, backed by a
+  per-donor `Vec<u64>` of stream ids appended to by `create_stream`, so a
+  pure-RPC client can list a donor's streams without a backend index.
 - `donation-vault`: regression coverage for one-stroop-per-second streams and
   their zero-rounded protocol fee.
 - `DataKey` enums now derive `Debug` in both contracts for clearer storage-key

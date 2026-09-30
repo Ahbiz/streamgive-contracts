@@ -10,6 +10,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Vec,
 };
 
 mod math;
@@ -81,6 +82,12 @@ pub enum DataKey {
     /// Optional NGO registry contract used to verify NGOs before a stream
     /// is opened. Absent means "no registry check configured".
     Registry,
+    /// Ids of every stream a donor has ever opened, in creation order.
+    /// Appended to by `create_stream`; never pruned, so a cancelled or
+    /// drained stream's id stays listed (its status is still queryable via
+    /// `get_stream`). Bounded by `max_streams_per_donor`. See
+    /// `streams_by_donor`.
+    StreamsByDonor(Address),
 }
 
 #[contracterror]
@@ -541,6 +548,46 @@ impl DonationVault {
             .instance()
             .get(&DataKey::NextStreamId)
             .unwrap_or(0)
+    }
+
+    /// Read-only lookup of every stream id `donor` has ever opened, in
+    /// creation order. Lets a pure-RPC client list a donor's streams
+    /// without a backend index. Empty if the donor has never called
+    /// `create_stream`. Ids stay listed after a stream is cancelled or
+    /// drained — use `get_stream` to check a given id's current status.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, token, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &2_000);
+    /// assert_eq!(client.streams_by_donor(&donor).len(), 0);
+    ///
+    /// let first = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// let second = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    ///
+    /// let ids = client.streams_by_donor(&donor);
+    /// assert_eq!(ids.len(), 2);
+    /// assert_eq!(ids.get(0), Some(first));
+    /// assert_eq!(ids.get(1), Some(second));
+    /// ```
+    pub fn streams_by_donor(env: Env, donor: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StreamsByDonor(donor))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Read-only lookup of how much a stream has accrued to the NGO so far.
@@ -1165,6 +1212,22 @@ impl DonationVault {
         env.storage().persistent().set(&donor_key, &new_count);
         env.storage().persistent().extend_ttl(
             &donor_key,
+            STREAM_LIFETIME_THRESHOLD,
+            STREAM_BUMP_AMOUNT,
+        );
+
+        let streams_by_donor_key = DataKey::StreamsByDonor(donor.clone());
+        let mut donor_stream_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&streams_by_donor_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        donor_stream_ids.push_back(stream_id);
+        env.storage()
+            .persistent()
+            .set(&streams_by_donor_key, &donor_stream_ids);
+        env.storage().persistent().extend_ttl(
+            &streams_by_donor_key,
             STREAM_LIFETIME_THRESHOLD,
             STREAM_BUMP_AMOUNT,
         );
