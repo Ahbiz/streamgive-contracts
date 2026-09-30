@@ -161,6 +161,50 @@ fn approve_unregistered_ngo_fails() {
 }
 
 #[test]
+fn batch_approve_approves_each_ngo_and_publishes_events() {
+    let (env, client, _admin) = setup();
+    let first_owner = Address::generate(&env);
+    let second_owner = Address::generate(&env);
+    client.register(&first_owner, &String::from_str(&env, "First NGO"));
+    client.register(&second_owner, &String::from_str(&env, "Second NGO"));
+
+    client.batch_approve(&vec![&env, first_owner.clone(), second_owner.clone()]);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), first_owner.clone()).into_val(&env),
+                ().into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), second_owner.clone()).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+    assert!(client.get_ngo(&first_owner).verified);
+    assert!(client.get_ngo(&second_owner).verified);
+}
+
+#[test]
+fn batch_approve_fails_on_unregistered_ngo_without_partial_approval() {
+    let (env, client, _admin) = setup();
+    let registered_owner = Address::generate(&env);
+    let unregistered_owner = Address::generate(&env);
+    client.register(&registered_owner, &String::from_str(&env, "Registered NGO"));
+
+    let result =
+        client.try_batch_approve(&vec![&env, registered_owner.clone(), unregistered_owner]);
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+    assert!(!client.get_ngo(&registered_owner).verified);
+}
+
+#[test]
 fn revoke_ngo_clears_verified_status() {
     let (env, client, _admin) = setup();
     let owner = Address::generate(&env);
