@@ -71,6 +71,10 @@ pub enum DataKey {
     Paused,
     Treasury,
     FeeBps,
+    /// The token allowlist surfaced to frontend token pickers. See
+    /// [`allowed_tokens`](DonationVault::allowed_tokens); empty until an
+    /// operator configures one.
+    AllowedTokens,
     /// Admin-settable per-donor stream cap. See `set_max_streams_per_donor`.
     MaxStreamsPerDonor,
     /// Count of streams a donor currently has open. Incremented on
@@ -131,6 +135,9 @@ pub enum Error {
     /// silently treated as `0` — that could collide with an existing
     /// stream. Returned instead of defaulting.
     StreamCounterMissing = 18,
+    /// The admin has renounced control, so admin-gated calls are permanently
+    /// disabled.
+    AdminRenounced = 16,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -327,6 +334,16 @@ impl DonationVault {
         Ok(())
     }
 
+    /// Permanently gives up admin control. Admin-authed.
+    ///
+    /// Clears the stored admin and any pending admin proposal. After this
+    /// call every admin-gated entry point fails with
+    /// `Error::AdminRenounced`, so the admin-gated surface is permanently
+    /// disabled. This cannot be undone.
+    ///
+    /// # Examples
+    ///
+    /// 
     /// Reads back the vault admin set by `init`.
     ///
     /// # Examples
@@ -628,6 +645,17 @@ impl DonationVault {
         Ok(math::accrued(stream.rate, elapsed, stream.balance))
     }
 
+    /// Read-only lookup of the ledger timestamp at which a stream's balance
+    /// runs out, so every client gets the same answer with the rounding done
+    /// in one place. The stream's `balance` counts everything not yet paid
+    /// out (including what's accrued but unwithdrawn) and `last_update` is
+    /// when it was last settled, so this is `last_update` plus the seconds
+    /// `balance` takes at `rate`, rounded up — a partial final second counts
+    /// as a whole one.
+    ///
+    /// Returns `None` when the stream will never deplete: a cancelled or
+    /// zero-rate stream, or a timestamp too far out to represent. An already
+    /// empty stream that still has a rate returns its `last_update`.
     /// Read-only view of the net amount the NGO would actually receive and the
     /// fee that would be taken if `withdraw` were called right now.
     ///
@@ -640,6 +668,7 @@ impl DonationVault {
     /// # Examples
     ///
     /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, token, Address, Env};
     /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
     /// # use donation_vault::{DonationVault, DonationVaultClient};
     /// # let env = Env::default();
@@ -654,6 +683,16 @@ impl DonationVault {
     /// # let donor = Address::generate(&env);
     /// # let ngo = Address::generate(&env);
     /// # token_client.mint(&donor, &1_000);
+    /// // 1_000 units at 300/s take 3.33s, so the stream ends at second 4.
+    /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &300);
+    /// let created_at = client.get_stream(&stream_id).created_at;
+    /// assert_eq!(client.depletion_time(&stream_id), Some(created_at + 4));
+    ///
+    /// // A cancelled stream never depletes.
+    /// client.cancel_stream(&stream_id);
+    /// assert_eq!(client.depletion_time(&stream_id), None);
+    /// ```
+    pub fn depletion_time(env: Env, stream_id: u64) -> Result<Option<u64>, Error> {
     /// let treasury = Address::generate(&env);
     /// client.set_treasury(&treasury);
     /// client.set_fee_bps(&500); // 5%
@@ -672,6 +711,8 @@ impl DonationVault {
             .get(&DataKey::Stream(stream_id))
             .ok_or(Error::StreamNotFound)?;
 
+        Ok(math::seconds_to_deplete(stream.rate, stream.balance)
+            .and_then(|seconds| stream.last_update.checked_add(seconds)))
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(stream.last_update);
         let gross = math::accrued(stream.rate, elapsed, stream.balance);
@@ -796,6 +837,19 @@ impl DonationVault {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Reads back all admin-set configuration in one call.
+    pub fn get_config(env: Env) -> Config {
+        Config {
+            paused: env
+                .storage()
+                .instance()
+                .get(&DataKey::Paused)
+                .unwrap_or(false),
+            treasury: env.storage().instance().get(&DataKey::Treasury),
+            fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+        }
     }
 
     /// Sets where the protocol fee (if any) gets paid. Admin-gated.
@@ -928,6 +982,15 @@ impl DonationVault {
     /// ```
     pub fn fee_bps(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
+    }
+
+    /// Returns the configured token allowlist for frontend token pickers.
+    /// Until an allowlist is configured, this returns an empty vector.
+    pub fn allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Sets the minimum `deposit` accepted by `create_stream`, letting an
