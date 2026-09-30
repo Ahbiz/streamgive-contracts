@@ -23,6 +23,9 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: read-only `pending_accrual` view.
 - `donation-vault`: regression coverage for one-stroop-per-second streams and
   their zero-rounded protocol fee.
+- `donation-vault`: regression coverage for `modify_rate` called in the same
+  ledger as `create_stream` (zero elapsed time settles nothing, but the new
+  rate still takes effect).
 - `DataKey` enums now derive `Debug` in both contracts for clearer storage-key
   diagnostics.
 - `donation-vault`: two-step admin transfer via `propose_admin` /
