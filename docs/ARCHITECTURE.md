@@ -52,6 +52,29 @@ Owns the `Stream` struct and the full lifecycle: `create_stream`,
 `withdraw`, `top_up`, `modify_rate`, `cancel_stream`. Emits one event
 per state-changing call; see `docs/EVENTS.md` for the topic/data schema.
 
+#### Token transfers and reentrancy
+
+Calls to a token contract are external interaction boundaries. The vault's
+security invariant is checks-effects-interactions: finalize and persist the
+stream accounting affected by an operation before calling the token contract.
+If accounting is written after a transfer, a reentrant call could observe stale
+state and act on a balance or accrual that has already been paid. Do not change
+transfer ordering without a security review. The vault relies on configured
+tokens being trusted, standard contracts that follow the expected token
+interface; it is not designed to defend against arbitrary malicious token
+implementations.
+
+This ordering is not currently consistent across all paths: `withdraw` stores
+its payout accounting before transferring, but `create_stream` and `top_up`
+transfer incoming funds before persisting the corresponding stream state, and
+`cancel_stream` transfers before persisting its final cancellation state (its
+`settle` helper also transfers accrued funds before recording that payout).
+`top_up` and `modify_rate` also call `settle`, which can transfer accrued funds
+before their updated stream state is persisted. The reentrancy-hardening work
+is tracked in [issue #194](https://github.com/StreamGive/streamgive-contracts/issues/194);
+until those paths are hardened, do not assume every token transfer follows the
+invariant above.
+
 ### `streamgive-backend` (Node / TypeScript)
 
 Two jobs, both off-chain:

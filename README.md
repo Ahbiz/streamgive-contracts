@@ -44,6 +44,12 @@ where it was and there is nothing to unwind when the pause is lifted.
 While the vault is paused, every entry point that moves tokens or changes
 a stream rejects the call with `Error::ContractPaused` (code 6) before
 touching storage or requiring any auth:
+Note that pausing does **not** stop time-based accrual. A stream's
+`pending_accrual` keeps growing while the vault is paused, so a stream
+paused for a week still owes a week of accrual once the pause is lifted.
+That accrual is claimable via `withdraw` as soon as the vault is
+unpaused.
+
 
 | Entry point     | While paused                                    |
 | --------------- | ----------------------------------------------- |
@@ -52,6 +58,7 @@ touching storage or requiring any auth:
 | `top_up`        | Rejected                                        |
 | `modify_rate`   | Rejected                                        |
 | `cancel_stream` | Still works — settles and refunds as usual      |
+
 
 `withdraw` being on that list is the point of the brake: it is the only
 path that pays tokens straight out of the vault, so a pause triggered by a
