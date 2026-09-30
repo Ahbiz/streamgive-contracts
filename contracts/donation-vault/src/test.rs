@@ -514,6 +514,123 @@ fn pending_accrual_matches_withdraw_without_mutating_state() {
 }
 
 #[test]
+fn depletion_time_is_last_update_plus_balance_over_rate() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let created_at = s.client.get_stream(&stream_id).created_at;
+
+    // 1_000 at 10/s divides evenly: exactly 100 seconds.
+    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 100));
+
+    // Nothing is settled by just asking, and the answer doesn't drift as
+    // time passes without a settlement.
+    s.env.ledger().with_mut(|l| l.timestamp += 30);
+    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 100));
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn depletion_time_rounds_a_partial_final_second_up() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // 1_000 / 300 = 3.33 seconds: three seconds leave 100 unpaid, so the
+    // stream is only empty once the fourth second has run.
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &300);
+    let created_at = s.client.get_stream(&stream_id).created_at;
+    let depletes_at = s.client.depletion_time(&stream_id).unwrap();
+    assert_eq!(depletes_at, created_at + 4);
+
+    // One second short of it, funds are still left...
+    s.env.ledger().with_mut(|l| l.timestamp = depletes_at - 1);
+    assert_eq!(s.client.pending_accrual(&stream_id), 900);
+
+    // ...and at the reported time the whole balance has accrued.
+    s.env.ledger().with_mut(|l| l.timestamp = depletes_at);
+    assert_eq!(s.client.pending_accrual(&stream_id), 1_000);
+}
+
+#[test]
+fn depletion_time_moves_with_a_settlement() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &300);
+
+    // Withdraw after 2 seconds: 600 paid, 400 left, settled at that moment.
+    s.env.ledger().with_mut(|l| l.timestamp += 2);
+    s.client.withdraw(&stream_id);
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 400);
+
+    // 400 / 300 = 1.33 -> 2 more seconds from the new last_update.
+    assert_eq!(
+        s.client.depletion_time(&stream_id),
+        Some(stream.last_update + 2)
+    );
+}
+
+#[test]
+fn depletion_time_of_a_balance_below_the_rate_is_one_second_out() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &5);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &5, &1_000);
+    let created_at = s.client.get_stream(&stream_id).created_at;
+
+    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 1));
+}
+
+#[test]
+fn depletion_time_of_a_drained_stream_is_its_last_update() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 500);
+    s.client.withdraw(&stream_id);
+
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 0);
+    assert_eq!(
+        s.client.depletion_time(&stream_id),
+        Some(stream.last_update)
+    );
+}
+
+#[test]
+fn depletion_time_of_a_cancelled_stream_is_none() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    assert_eq!(s.client.depletion_time(&stream_id), None);
+}
+
+#[test]
+fn depletion_time_on_unknown_stream_fails() {
+    let s = setup();
+    let result = s.client.try_depletion_time(&999);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+}
+
+#[test]
 fn withdraw_with_nothing_accrued_fails() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
