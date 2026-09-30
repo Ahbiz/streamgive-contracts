@@ -167,6 +167,9 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
 | 14   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
 | 15   | `InvalidAdmin`        | `propose_admin` was called with the current admin instead of a different address. |
+| 16   | `NgoNotVerified`      | `create_stream` targeted an NGO that isn't verified in the configured registry. |
+| 17   | `StreamLimitExceeded` | The donor already has `max_streams_per_donor` open streams.              |
+| 18   | `StreamCounterMissing`| `NextStreamId` was missing from instance storage (should not happen after `init`). |
 
 ### `ngo-registry`
 

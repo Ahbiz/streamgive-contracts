@@ -112,6 +112,18 @@ pub enum Error {
     StreamCancelled = 14,
     /// The proposed administrator is not a valid replacement.
     InvalidAdmin = 15,
+    /// The NGO address passed to `create_stream` is not verified in the
+    /// configured ngo-registry. Only set when a registry address has been
+    /// stored via `set_registry`.
+    NgoNotVerified = 16,
+    /// The donor already has `max_streams_per_donor` streams. Raised by
+    /// `create_stream` before the deposit is pulled. See issue #94.
+    StreamLimitExceeded = 17,
+    /// `NextStreamId` was missing from instance storage. `init` always sets
+    /// it, so this shouldn't happen in practice, but a missing counter is
+    /// silently treated as `0` — that could collide with an existing
+    /// stream. Returned instead of defaulting.
+    StreamCounterMissing = 18,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
