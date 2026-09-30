@@ -65,6 +65,43 @@ donor's unspent deposit. The read-only views (`admin`, `pending_admin`,
 `fee_bps`) and `extend_stream` also keep working, since none of them can
 move funds, and `unpause` is of course still reachable.
 
+## Storage TTL and keeping entries alive
+
+Soroban contracts use bounded Time-To-Live (TTL) for on-chain state retention:
+
+- **Instance storage** (contract admins, configuration, pause flags) is bumped
+  to 30 days (`518,400` ledgers) on every state-changing call.
+- **Persistent storage** (each individual `Stream` record in `donation-vault` and
+  each `Ngo` record in `ngo-registry`) has an independent 90-day TTL (`1,555,200`
+  ledgers) that must be maintained per entry.
+
+### Expiry risk for idle entries
+
+If a stream has no activity (withdrawals, top-ups, rate modifications) or an NGO
+entry receives no updates for 90 consecutive days, its TTL expires and the network
+**archives** the entry.
+
+Archived entries cannot be read or modified by normal contract calls (`get_stream`,
+`withdraw`, verification lookups, etc. will fail) until a Soroban state restoration
+transaction is submitted and network restoration fees are paid. Long-running streams
+with low drip rates or infrequent withdrawals are especially at risk if left untouched.
+
+### Keep-alive entry points (`extend_stream` & `touch_ngo`)
+
+To protect idle entries from archival without moving funds, modifying balances, or
+requiring admin credentials, both contracts provide permissionless keep-alive entry
+points that anyone (donors, NGOs, keeper bots, or indexers) can invoke:
+
+- **`donation-vault::extend_stream(stream_id)`**: Extends the persistent storage
+  TTL of `DataKey::Stream(stream_id)` back to 90 days. Can be called at any time,
+  requires no authorization, and remains accessible even while the vault is paused.
+- **`ngo-registry::touch_ngo(owner)`**: Refreshes both the registry instance TTL
+  (to 30 days) and the NGO's persistent storage TTL (`DataKey::Ngo(owner)`) back
+  to 90 days without altering registration status. Requires no authorization.
+
+For full key specifications, bump thresholds, and archival lifecycle details, see
+[docs/STORAGE.md](docs/STORAGE.md).
+
 ## Related repositories
 
 - [streamgive-backend](https://github.com/streamgive/streamgive-backend) — indexer & API
