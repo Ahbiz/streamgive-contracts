@@ -3,6 +3,9 @@
 Soroban smart contracts powering StreamGive, a recurring/streaming donation
 platform for verified NGOs on Stellar.
 
+For how these contracts fit with the backend and frontend — and how a
+donation flows end to end — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Contracts
 
 - `ngo-registry` — on-chain NGO application, verification, and registry
@@ -157,12 +160,13 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
 | 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
-| 9    | `ArithmeticOverflow`  | A balance, payout, or stream-id calculation exceeded its supported range. |
-| 10   | `DepositTooLow`       | `create_stream` received a deposit below the configured minimum. |
+| 9    | `ArithmeticOverflow`  | A stream balance, withdrawn total, or stream ID would exceed its integer range. |
+| 10   | `DepositTooLow`       | `create_stream` was called with a deposit below the admin-configured minimum. |
 | 11   | `AlreadyPaused`       | `pause` was called when the vault was already paused. |
 | 12   | `AlreadyUnpaused`     | `unpause` was called when the vault was already active. |
 | 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
-| 14   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream already cancelled. |
+| 14   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
+| 15   | `InvalidAdmin`        | `propose_admin` was called with the current admin instead of a different address. |
 
 ### `ngo-registry`
 
@@ -173,7 +177,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
 | 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
 | 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
-| 6    | `NameTooLong`         | `register` was called with a name longer than 200 bytes.        |
+| 6    | `InvalidName`         | `register` was called with a zero-length name.                   |
 | 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
 
 ## Status
