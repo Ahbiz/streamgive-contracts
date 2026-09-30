@@ -1165,6 +1165,37 @@ fn create_stream_stores_every_field() {
     );
 }
 
+#[test]
+fn stream_ids_are_sequential_and_stream_count_tracks_them() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+
+    assert_eq!(s.client.stream_count(), 0);
+
+    let id_a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.stream_count(), 1);
+
+    let id_b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.stream_count(), 2);
+
+    let id_c = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.stream_count(), 3);
+
+    // Ids increment by exactly one, starting from zero.
+    assert_eq!(id_a, 0);
+    assert_eq!(id_b, id_a + 1);
+    assert_eq!(id_c, id_b + 1);
+
+    // stream_count matches the number of streams actually created.
+    assert_eq!(s.client.stream_count(), 3);
+}
+
 fn instance_ttl(s: &Setup) -> u32 {
     s.env
         .as_contract(&s.client.address, || s.env.storage().instance().get_ttl())
