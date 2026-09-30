@@ -26,6 +26,7 @@ pub struct Ngo {
 #[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
     Ngo(Address),
     NgoCount,
 }
@@ -44,6 +45,11 @@ pub enum Error {
     NameTooLong = 6,
     /// The NGO has not been approved, so it cannot be revoked.
     NotVerified = 7,
+    /// `accept_admin` or `cancel_admin_proposal` was called without a prior
+    /// (or already-completed) `propose_admin`.
+    NoPendingAdmin = 8,
+    /// The proposed administrator is not a valid replacement.
+    InvalidAdmin = 9,
 }
 
 /// Upper bound on `Ngo.name`, in bytes. Persistent storage cost scales with
@@ -141,6 +147,137 @@ impl NgoRegistry {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Reads back the address proposed by `propose_admin`, if any hasn't
+    /// yet been accepted or cancelled.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// assert_eq!(client.pending_admin(), None);
+    ///
+    /// let new_admin = Address::generate(&env);
+    /// client.propose_admin(&new_admin);
+    /// assert_eq!(client.pending_admin(), Some(new_admin));
+    /// ```
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    /// Starts a two-step admin transfer by recording `new_admin` as pending.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// let new_admin = Address::generate(&env);
+    /// client.propose_admin(&new_admin);
+    /// // The old admin is still in charge until accept_admin is called.
+    /// assert_eq!(client.admin(), admin);
+    /// ```
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let current_admin = require_admin(&env)?;
+        if new_admin == current_admin {
+            return Err(Error::InvalidAdmin);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        extend_instance_ttl(&env);
+
+        env.events()
+            .publish((symbol_short!("propadmin"),), new_admin);
+
+        Ok(())
+    }
+
+    /// Completes a two-step admin transfer.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// let new_admin = Address::generate(&env);
+    /// client.propose_admin(&new_admin);
+    /// client.accept_admin();
+    /// assert_eq!(client.admin(), new_admin);
+    /// ```
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+        pending.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        extend_instance_ttl(&env);
+
+        env.events().publish((symbol_short!("acptadmin"),), pending);
+
+        Ok(())
+    }
+
+    /// Withdraws a pending admin proposal, leaving nothing pending.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// let new_admin = Address::generate(&env);
+    /// client.propose_admin(&new_admin);
+    ///
+    /// // The admin changes their mind before it's accepted.
+    /// client.cancel_admin_proposal();
+    ///
+    /// // Nothing left to accept.
+    /// let result = client.try_accept_admin();
+    /// assert!(result.is_err());
+    /// ```
+    pub fn cancel_admin_proposal(env: Env) -> Result<(), Error> {
+        require_admin(&env)?;
+
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            return Err(Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        extend_instance_ttl(&env);
+
+        env.events().publish((symbol_short!("canceladm"),), ());
+
+        Ok(())
     }
 
     /// Submits an NGO application. Callable by the NGO's own address.

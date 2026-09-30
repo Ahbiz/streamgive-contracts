@@ -182,6 +182,8 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
 | 6    | `InvalidName`         | `register` was called with a zero-length name.                   |
 | 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
+| 8    | `NoPendingAdmin`      | `accept_admin` or `cancel_admin_proposal` was called without a prior (or already-completed) `propose_admin`. |
+| 9    | `InvalidAdmin`        | `propose_admin` was called with the current admin instead of a different address. |
 
 ## Status
 

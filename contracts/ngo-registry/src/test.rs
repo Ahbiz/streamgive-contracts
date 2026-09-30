@@ -3,7 +3,9 @@
 
 use super::*;
 use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
-use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
+use soroban_sdk::testutils::{
+    Address as _, AuthorizedFunction, Events as _, Ledger, MockAuth, MockAuthInvoke,
+};
 use soroban_sdk::{vec, IntoVal, Symbol, Val, Vec};
 
 fn setup() -> (Env, NgoRegistryClient<'static>, Address) {
@@ -456,6 +458,215 @@ fn revoke_ngo_publishes_event() {
             (
                 client.address.clone(),
                 (symbol_short!("revoked"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+// --- Two-step admin transfer (issue #37) ---
+//
+// Mirrors donation-vault's propose_admin / accept_admin / cancel_admin_proposal
+// (see DonationVault's tests of the same name) so both contracts behave the
+// same way for operators managing admin handover.
+
+#[test]
+fn pending_admin_defaults_to_none() {
+    let (_env, client, _admin) = setup();
+    assert_eq!(client.pending_admin(), None);
+}
+
+#[test]
+fn propose_then_accept_admin_transfers_control() {
+    let (env, client, old_admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+    assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+    // Admin hasn't changed yet — only proposed.
+    assert_eq!(client.admin(), old_admin);
+
+    client.accept_admin();
+    assert_eq!(client.admin(), new_admin);
+    assert_eq!(client.pending_admin(), None);
+
+    // The new admin can act as admin.
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+    assert!(client.get_ngo(&owner).verified);
+}
+
+#[test]
+fn propose_admin_rejects_current_admin() {
+    let (_env, client, admin) = setup();
+
+    let result = client.try_propose_admin(&admin);
+    assert_eq!(result, Err(Ok(Error::InvalidAdmin)));
+    assert_eq!(client.pending_admin(), None);
+}
+
+#[test]
+fn accept_admin_without_proposal_fails() {
+    let (_env, client, _admin) = setup();
+
+    let result = client.try_accept_admin();
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+}
+
+#[test]
+fn cancel_admin_proposal_without_proposal_fails() {
+    let (_env, client, _admin) = setup();
+
+    let result = client.try_cancel_admin_proposal();
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+}
+
+#[test]
+fn cancel_admin_proposal_clears_pending() {
+    let (env, client, old_admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+    assert_eq!(client.pending_admin(), Some(new_admin));
+
+    client.cancel_admin_proposal();
+    assert_eq!(client.pending_admin(), None);
+    assert_eq!(client.admin(), old_admin);
+
+    // Nothing left to accept.
+    let result = client.try_accept_admin();
+    assert_eq!(result, Err(Ok(Error::NoPendingAdmin)));
+}
+
+#[test]
+fn repropose_admin_overwrites_earlier_proposal() {
+    let (env, client, old_admin) = setup();
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+
+    client.propose_admin(&admin_a);
+    assert_eq!(client.pending_admin(), Some(admin_a.clone()));
+
+    // Proposing again replaces the pending address instead of queueing.
+    client.propose_admin(&admin_b);
+    assert_eq!(
+        client.pending_admin(),
+        Some(admin_b.clone()),
+        "the second proposal must overwrite the first, not queue behind it"
+    );
+
+    client.accept_admin();
+
+    // Control actually moved to B, and only to B.
+    assert_eq!(client.admin(), admin_b);
+    assert_ne!(client.admin(), old_admin);
+    assert_ne!(client.admin(), admin_a);
+}
+
+#[test]
+fn accept_admin_requires_pending_admin_auth() {
+    let (env, client, _admin) = setup();
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&new_admin);
+
+    client.accept_admin();
+
+    // The proposed address, not the outgoing admin, has to accept.
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    let (address, invocation) = &auths[0];
+    assert_eq!(address, &new_admin);
+    match &invocation.function {
+        AuthorizedFunction::Contract((contract, function, _)) => {
+            assert_eq!(contract, &client.address);
+            assert_eq!(function, &Symbol::new(&env, "accept_admin"));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
+
+#[test]
+#[should_panic]
+fn old_admin_loses_admin_gated_access_after_transfer() {
+    let (env, client, old_admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+    client.accept_admin();
+
+    // approve_ngo requires the current admin's auth; only the old admin
+    // authorizes this call, and the old admin is no longer admin.
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    env.mock_auths(&[MockAuth {
+        address: &old_admin,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "approve_ngo",
+            args: (owner.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.approve_ngo(&owner);
+}
+
+#[test]
+fn propose_admin_publishes_event() {
+    let (env, client, _admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&new_admin);
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("propadmin"),).into_val(&env),
+                new_admin.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn accept_admin_publishes_event() {
+    let (env, client, _admin) = setup();
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&new_admin);
+
+    client.accept_admin();
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("acptadmin"),).into_val(&env),
+                new_admin.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn cancel_admin_proposal_publishes_event() {
+    let (env, client, _admin) = setup();
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&new_admin);
+
+    client.cancel_admin_proposal();
+
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("canceladm"),).into_val(&env),
                 ().into_val(&env),
             ),
         ]
