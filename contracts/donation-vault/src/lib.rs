@@ -139,36 +139,8 @@ pub enum Error {
     DepositTooLow = 10,
     AlreadyPaused = 11,
     AlreadyUnpaused = 12,
-    /// The donor and the NGO are the same address, so the stream would pay
-    /// the donor back their own deposit. Rejected at creation: a stream that
-    /// nets to zero still counts as a committed donation in the indexer and
-    /// on impact pages, which is a way to inflate those totals for free.
     SelfStream = 13,
-    /// The stream has already been cancelled and closed out.
     StreamCancelled = 14,
-    /// The proposed administrator is not a valid replacement.
-    InvalidAdmin = 15,
-    /// The donor has already reached `max_streams_per_donor`'s cap.
-    StreamLimitExceeded = 16,
-    /// A registry is configured, but the target NGO is unknown to it or not
-    /// marked verified.
-    NgoNotVerified = 17,
-    /// `DataKey::NextStreamId` was missing from instance storage. `init`
-    /// always sets it, so this should never happen in practice; returned
-    /// rather than defaulting to `0`, which could collide with an existing
-    /// stream.
-    StreamCounterMissing = 18,
-    /// `rescue_stream` was called while the vault is not paused. It only
-    /// exists for incident response, not as an ordinary way to close a
-    /// stream out.
-    NotPaused = 19,
-    /// The admin has renounced control, so admin-gated calls are permanently
-    /// disabled.
-    AdminRenounced = 20,
-    /// `withdraw_batch` was handed streams that don't all belong to the same
-    /// NGO. Payouts are aggregated per token, so a single batch can only ever
-    /// pay one NGO.
-    MixedNgo = 21,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take

@@ -2315,6 +2315,9 @@ fn admin_can_set_the_per_donor_cap() {
     assert_eq!(s.client.max_streams_per_donor(), 5);
 }
 
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
+    assert_eq!(net, 500); // full accrual goes to the NGO
 #[test]
 fn non_admin_cannot_set_the_per_donor_cap() {
     let s = setup();
@@ -2363,6 +2366,9 @@ fn raising_the_cap_lets_the_next_stream_through() {
     assert_eq!(s.client.get_stream(&stream_id).donor, s.donor);
 }
 
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
+    assert_eq!(net, 500);
 #[test]
 fn lowering_the_cap_does_not_retroactively_affect_existing_streams() {
     let s = setup();
@@ -2427,6 +2433,9 @@ fn new_stream_starts_active() {
     assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
 }
 
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 25); // 5% of 500
+    assert_eq!(net, 475); // 500 - 25
 #[test]
 fn cancelled_stream_reports_cancelled() {
     let s = setup();

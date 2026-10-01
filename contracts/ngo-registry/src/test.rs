@@ -79,6 +79,25 @@ fn double_register_fails() {
 }
 
 #[test]
+fn revoke_unverified_ngo_fails_without_emitting_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    let result = client.try_revoke_ngo(&owner);
+
+    assert_eq!(result, Err(Ok(Error::NotVerified)));
+    assert!(env.events().all().events().is_empty());
+    assert!(!client.get_ngo(&owner).verified);
+}
+
+#[test]
+fn ngo_count_initially_zero() {
+    let (_env, client, _admin) = setup();
+    assert_eq!(client.ngo_count(), 0);
+}
+
+#[test]
 fn register_rejects_name_over_max_length() {
     let (env, client, _admin) = setup();
     let owner = Address::generate(&env);
