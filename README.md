@@ -83,3 +83,166 @@ Run the full test suite for all contracts from the workspace root:
 
 ```sh
 cargo test --workspace
+```
+
+To run tests for a single contract:
+
+```sh
+cargo test -p donation-vault
+cargo test -p ngo-registry
+```
+
+Notable coverage:
+
+- `donation-vault`'s `math` module unit-tests the streaming accrual
+  calculation (`accrued`) directly: zero/negative rate, zero balance,
+  zero elapsed time, capping at the remaining balance, and saturating
+  instead of overflowing/panicking near `i128::MAX`.
+- It also includes a deterministic grid-based invariant sweep
+  (`invariants_hold_across_a_grid_of_inputs`) that checks, across a
+  matrix of rates, balances, and elapsed durations, that accrual is
+  always non-negative, never exceeds the remaining balance, and is
+  monotonically non-decreasing as elapsed time (or rate) grows — a
+  stand-in for property-based testing over the streaming math's edge
+  cases.
+
+CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
+`cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
+build, a wasm binary size check (see
+[`scripts/check-wasm-size.sh`](scripts/check-wasm-size.sh)), and
+`cargo test --workspace` on every push and pull request.
+
+## Deploying
+
+[`scripts/deploy-testnet.sh`](scripts/deploy-testnet.sh) builds both
+contracts, deploys `ngo-registry` and `donation-vault` to Stellar
+testnet, initializes each one with an admin, and writes the resulting
+contract ids to [`deployments.json`](deployments.json).
+
+### Prerequisites
+
+- The [`stellar` CLI](https://developers.stellar.org/docs/tools/cli).
+- `rustup` with the `wasm32v1-none` target:
+  `rustup target add wasm32v1-none`.
+- A funded testnet identity, for example:
+  `stellar keys generate my-testnet-identity --network testnet --fund`.
+- Node.js (optional): only used to keep an existing `mainnet` entry in
+  `deployments.json` when the file is rewritten.
+
+The script checks for the CLI, `rustup`, and the wasm target up front and
+exits before deploying anything if one is missing.
+
+### Environment variables
+
+- `STELLAR_SOURCE_ACCOUNT` (required): the name of the funded Stellar CLI
+  identity that signs and pays for the deploy.
+- `STELLAR_ADMIN_ADDRESS` (optional): the `G...` address set as admin of
+  both contracts. Use a wallet a human can sign with, because admin
+  actions such as approving NGOs are driven from the browser admin panel,
+  which a CLI-only deployer key cannot do. `init` can only be called once
+  per contract. If unset, the admin falls back to the address of
+  `STELLAR_SOURCE_ACCOUNT`, which is fine for a throwaway deploy only.
+
+### Running the script
+
+From the repo root:
+
+```sh
+STELLAR_SOURCE_ACCOUNT=my-testnet-identity \
+STELLAR_ADMIN_ADDRESS=G... \
+./scripts/deploy-testnet.sh
+```
+
+### `deployments.json`
+
+`deployments.json` holds the live testnet deployment: the network, when it
+was deployed, the admin address, and the `ngo-registry` and
+`donation-vault` contract ids. The backend and frontend read these ids
+from their env files, so update them there after a redeploy. Running the
+script overwrites this file, so avoid committing a version rewritten by a
+personal test deploy.
+
+A mainnet deployment is recorded under the `mainnet` key of the same file
+by `scripts/deploy-mainnet.sh`, which also requires `STELLAR_ADMIN_ADDRESS`
+and `STELLAR_RPC_URL`.
+
+## FAQ
+
+### Why is this project licensed under Apache-2.0?
+
+Apache-2.0 permits reuse and modification while providing an explicit patent
+license and clear contributor protections. That makes it a practical default
+for contracts intended to be integrated by wallets, applications, and other
+open-source projects.
+
+### Why are release overflow checks enabled?
+
+The contracts move token balances and calculate payouts with `i128`. A wrapped
+balance could silently corrupt funds, so release builds keep `overflow-checks`
+enabled and return explicit arithmetic errors where the contract can handle
+the failure.
+
+### Why are the contracts `no_std`?
+
+Soroban contracts run in a constrained WebAssembly environment. `no_std`
+keeps the deployed artifact small and avoids bringing operating-system
+facilities that are unavailable on-chain.
+
+### Why does each stream have its own TTL?
+
+Persistent storage is retained per key. A stream that is never touched can
+expire independently of the vault instance, so state-changing calls and the
+permissionless `extend_stream` entry point refresh the specific stream that
+needs to remain available.
+
+### What is the cancelled-stream grace period?
+
+The admin can configure `cancel_grace_ledgers` so indexers have additional
+time to observe and process a cancellation. Cancelling a stream retains its
+record for the normal stream TTL plus that configured grace period; a value of
+zero keeps the default retention period.
+
+## Error codes
+
+Each contract exposes its failures as a `#[contracterror] enum Error`,
+returned as `Result<_, Error>` from every fallible entry point. Clients see
+the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
+
+### `donation-vault`
+
+| Code | Error                | Meaning                                                                 |
+| ---- | --------------------- | ------------------------------------------------------------------------ |
+| 1    | `AlreadyInitialized`  | `init` was already called; the vault already has an admin.               |
+| 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.          |
+| 3    | `StreamNotFound`      | No stream exists for the given stream id.                                |
+| 4    | `InvalidAmount`       | `deposit` or `rate` passed to `create_stream`, the `amount` passed to `top_up`, or the `new_rate` passed to `modify_rate` was zero or negative. |
+| 5    | `NothingToWithdraw`   | The stream has accrued nothing since its last checkpoint.                |
+| 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
+| 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
+| 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
+| 9    | `ArithmeticOverflow`  | A balance, payout, or stream-id calculation exceeded its supported range. |
+| 10   | `DepositTooLow`       | `create_stream` was called with a deposit below the admin-configured minimum. |
+| 11   | `AlreadyPaused`       | `pause` was called when the vault was already paused. |
+| 12   | `AlreadyUnpaused`     | `unpause` was called when the vault was already active. |
+| 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
+| 14   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
+
+### `ngo-registry`
+
+| Code | Error                | Meaning                                                          |
+| ---- | --------------------- | ------------------------------------------------------------------ |
+| 1    | `AlreadyInitialized`  | `init` was already called; the registry already has an admin.    |
+| 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.  |
+| 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
+| 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
+| 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
+| 6    | `InvalidName`         | `register` was called with a zero-length name.                   |
+| 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
+
+## Status
+
+Early development.
+
+## License
+
+Apache-2.0 — see [LICENSE](./LICENSE).
