@@ -45,6 +45,11 @@ fn last_event(env: &Env) -> LastEvent {
     }
 }
 
+/// Asserts the most recently published event matches `(topics, data)`.
+/// A thin wrapper around `last_event` for call sites that don't need to
+/// hold onto the event value afterward.
+fn assert_last_event(env: &Env, topics: Vec<Val>, data: Val) {
+    assert_eq!(last_event(env), (topics, data));
 /// Asserts the most recently published event matches the given topics and
 /// data, as a one-line shorthand over `last_event` for call sites that don't
 /// need to keep the captured event around for anything else.
@@ -350,6 +355,7 @@ fn create_stream_errors_instead_of_defaulting_when_counter_is_missing() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
     assert_eq!(s.client.min_deposit(), 0);
+    s.token_admin.mint(&s.donor, &1_000);
 
     // `init` always sets NextStreamId, so this shouldn't happen in
     // practice — but nothing enforces that, and if the counter were ever
@@ -2609,6 +2615,12 @@ fn status_is_queryable_after_cancel_then_further_operations_fail() {
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     s.client.cancel_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Cancelled);
+    // withdraw on a cancelled stream finds nothing accrued (cancel zeroed
+    // both rate and balance), regardless of how much time passes after.
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    let result = s.client.try_withdraw(&stream_id);
+    assert_eq!(result, Err(Ok(Error::NothingToWithdraw)));
     assert_eq!(
         s.client.get_stream(&stream_id).status,
         StreamStatus::Cancelled

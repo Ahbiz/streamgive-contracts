@@ -64,6 +64,38 @@ event as cancelling the most recent `approved` event for that address.
 | Topics | `("revoked", ngo_owner: Address)` |
 | Data | `()` (no payload) |
 
+### `propadmin`
+
+Emitted by `propose_admin` when the current admin nominates a new admin.
+The transfer is not complete until the nominated address calls
+`accept_admin` and an `acptadmin` event is emitted.
+
+| | |
+|---|---|
+| Topics | `("propadmin",)` |
+| Data | `new_admin: Address` |
+
+### `acptadmin`
+
+Emitted by `accept_admin` when the nominated admin accepts the transfer.
+After this event the address in `data` is the active admin; the previous
+admin has no further authority.
+
+| | |
+|---|---|
+| Topics | `("acptadmin",)` |
+| Data | `new_admin: Address` |
+
+### `canceladm`
+
+Emitted by `cancel_admin_proposal` when the current admin withdraws a
+pending proposal before it's accepted.
+
+| | |
+|---|---|
+| Topics | `("canceladm",)` |
+| Data | `()` (no payload) |
+
 ## `donation-vault`
 
 ### `propadmin`
