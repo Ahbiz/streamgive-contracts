@@ -10,7 +10,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
-    Vec,
+    Map, Vec,
 };
 
 mod math;
@@ -107,6 +107,10 @@ pub enum Error {
     /// leave its type's range. Returned instead of letting the release
     /// profile's overflow checks panic and abort the transaction.
     ArithmeticOverflow = 9,
+    /// A stream's `balance` or `withdrawn` (or the stream-id counter) would
+    /// leave its type's range. Returned instead of letting the release
+    /// profile's overflow checks panic and abort the transaction.
+    ArithmeticOverflow = 9,
     /// `deposit` was below the configured `min_deposit`.
     DepositTooLow = 10,
     AlreadyPaused = 11,
@@ -136,7 +140,11 @@ pub enum Error {
     NotPaused = 19,
     /// The admin has renounced control, so admin-gated calls are permanently
     /// disabled.
-    AdminRenounced = 16,
+    AdminRenounced = 20,
+    /// `withdraw_batch` was handed streams that don't all belong to the same
+    /// NGO. Payouts are aggregated per token, so a single batch can only ever
+    /// pay one NGO.
+    MixedNgo = 21,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -722,21 +730,4 @@ impl DonationVault {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # use soroban_sdk::{testutils::Address as _, token, Address, Env};
-    /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
-    /// # use donation_vault::{DonationVault, DonationVaultClient};
-    /// # let env = Env::default();
-    /// # env.mock_all_auths();
-    /// # let contract_id = env.register(DonationVault, ());
-    /// # let client = DonationVaultClient::new(&env, &contract_id);
-    /// # let admin = Address::generate(&env);
-    /// # client.init(&admin);
-    /// # let token_admin = Address::generate(&env);
-    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
-    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
-    /// # let donor = Address::generate(&env);
-    /// # let ngo = Address::generate(&env);
-    /// # token_client.mint(&donor, &1_000);
-    /// // 1_000 units at 300/s take 3.33s, so the stream ends at second 4.
-    /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &300);
-    /// let created
+    /// # use soroban_sdk::{testutils::Address as _, token,
