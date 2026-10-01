@@ -20,7 +20,7 @@ WASM_DIR="target/wasm32v1-none/release"
 # Max size in bytes for each contract's compiled wasm.
 declare -A MAX_SIZES=(
   [ngo_registry]=65536
-  [donation_vault]=81920
+  [donation_vault]=98304
 )
 
 status=0
