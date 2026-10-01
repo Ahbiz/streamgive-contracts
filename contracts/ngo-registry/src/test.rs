@@ -125,6 +125,33 @@ fn get_unregistered_ngo_fails() {
 }
 
 #[test]
+fn is_verified_returns_false_for_registered_unverified_ngo() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    assert!(!client.is_verified(&owner));
+}
+
+#[test]
+fn is_verified_returns_true_for_verified_ngo() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+
+    assert!(client.is_verified(&owner));
+}
+
+#[test]
+fn is_verified_returns_false_for_unknown_address() {
+    let (env, client, _admin) = setup();
+    let random = Address::generate(&env);
+
+    assert!(!client.is_verified(&random));
+}
+
+#[test]
 fn approve_ngo_marks_verified() {
     let (env, client, _admin) = setup();
     let owner = Address::generate(&env);

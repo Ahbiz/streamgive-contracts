@@ -305,6 +305,16 @@ impl NgoRegistry {
             .ok_or(Error::NotRegistered)
     }
 
+    /// Returns whether an address is a registered, verified NGO.
+    /// Unknown and unverified addresses both return `false`.
+    pub fn is_verified(env: Env, owner: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, Ngo>(&DataKey::Ngo(owner))
+            .map(|ngo| ngo.verified)
+            .unwrap_or(false)
+    }
+
     /// Reads back the total number of registered NGOs.
     ///
     /// Lets callers (such as the impact page) display the total count
