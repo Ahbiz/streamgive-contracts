@@ -1060,6 +1060,14 @@ fn set_fee_bps_boundary_exact_max_succeeds() {
 }
 
 #[test]
+fn max_fee_bps_is_exposed_on_chain() {
+    let s = setup();
+    assert_eq!(s.client.max_fee_bps(), 1_000);
+}
+
+#[test]
+#[should_panic]
+fn withdraw_fails_for_non_ngo_caller() {
 fn token_fee_bps_falls_back_to_the_global_default_with_no_override() {
     let s = setup();
     s.client.set_fee_bps(&500); // 5% global default

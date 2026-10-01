@@ -197,6 +197,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
 | 6    | `NameTooLong`         | `register` was called with a name longer than 200 bytes.        |
 | 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
+| 8    | `ArithmeticOverflow`  | The total NGO counter could not be incremented without exceeding its range. |
 
 ## Status
 

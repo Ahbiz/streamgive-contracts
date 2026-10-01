@@ -27,6 +27,7 @@ pub struct Ngo {
 #[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
+    TotalNgos,
     Ngo(Address),
     NgoCount,
 }
@@ -45,6 +46,7 @@ pub enum Error {
     NameTooLong = 6,
     /// The NGO has not been approved, so it cannot be revoked.
     NotVerified = 7,
+    ArithmeticOverflow = 8,
 }
 
 /// Upper bound on `Ngo.name`, in bytes. Persistent storage cost scales with
@@ -139,6 +141,7 @@ impl NgoRegistry {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::TotalNgos, &0u32);
         extend_instance_ttl(&env);
         Ok(())
     }
@@ -205,16 +208,23 @@ impl NgoRegistry {
             verified: false,
         };
         env.storage().persistent().set(&key, &ngo);
-
         let count: u64 = env
             .storage()
             .instance()
             .get(&DataKey::NgoCount)
             .unwrap_or(0);
+        let next_count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        let total_ngos: u32 = match env.storage().instance().get(&DataKey::TotalNgos) {
+            Some(total) => total,
+            None => u32::try_from(count).map_err(|_| Error::ArithmeticOverflow)?,
+        };
+        let next_total = total_ngos.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::NgoCount, &(count + 1));
-
+            .set(&DataKey::TotalNgos, &next_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::NgoCount, &next_count);
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &owner);
 
@@ -224,6 +234,12 @@ impl NgoRegistry {
         Ok(())
     }
 
+    /// Returns the number of successfully registered NGOs.
+    pub fn total_ngos(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalNgos)
+            .unwrap_or(0)
     /// Removes the caller's unverified NGO application.
     ///
     /// Verified registrations are intentionally permanent until an admin

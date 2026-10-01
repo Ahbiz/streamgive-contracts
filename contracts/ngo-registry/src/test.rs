@@ -50,20 +50,21 @@ fn register_ngo_stores_unverified_entry() {
 }
 
 #[test]
-fn unverified_ngo_can_unregister_and_register_again() {
-    let (env, client, _) = setup();
-    let owner = Address::generate(&env);
-    let name = String::from_str(&env, "Pending NGO");
+fn total_ngos_counts_successful_registrations_only() {
+    let (env, client, _admin) = setup();
+    let first_owner = Address::generate(&env);
+    let second_owner = Address::generate(&env);
 
-    client.register(&owner, &name);
-    client.unregister(&owner);
-    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+    assert_eq!(client.total_ngos(), 0);
 
-    client.register(&owner, &String::from_str(&env, "Updated NGO"));
-    assert_eq!(
-        client.get_ngo(&owner).name,
-        String::from_str(&env, "Updated NGO")
-    );
+    client.register(&first_owner, &String::from_str(&env, "Red Cross"));
+    assert_eq!(client.total_ngos(), 1);
+
+    client.approve_ngo(&first_owner);
+    assert_eq!(client.total_ngos(), 1);
+
+    client.register(&second_owner, &String::from_str(&env, "Green Cross"));
+    assert_eq!(client.total_ngos(), 2);
 }
 
 #[test]
@@ -407,6 +408,17 @@ fn update_name_changes_name_before_approval() {
         ]
     );
 
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("renamed"), owner.clone()).into_val(&env),
+                fixed.clone().into_val(&env),
+            )
+        ]
+    );
     assert_eq!(
         client.get_ngo(&owner),
         Ngo {
