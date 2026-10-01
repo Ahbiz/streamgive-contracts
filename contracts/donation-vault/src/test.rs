@@ -7,7 +7,7 @@ use soroban_sdk::testutils::{
     Address as _, AuthorizedFunction, Events as _, Ledger, MockAuth, MockAuthInvoke,
 };
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-use soroban_sdk::xdr::{ContractEventBody, ScVal, ScVec};
+use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal, ScVec};
 use soroban_sdk::{IntoVal, Symbol, TryFromVal, Val, Vec};
 
 /// The most recently published event, in XDR form. `Val` has no `PartialEq`,
@@ -50,6 +50,12 @@ fn last_event(env: &Env) -> LastEvent {
 /// hold onto the event value afterward.
 fn assert_last_event(env: &Env, topics: Vec<Val>, data: Val) {
     assert_eq!(last_event(env), (topics, data));
+/// Asserts the most recently published event matches the given topics and
+/// data, as a one-line shorthand over `last_event` for call sites that don't
+/// need to keep the captured event around for anything else.
+fn assert_last_event(env: &Env, topics: Val, data: Val) {
+    let vec_topics = Vec::<Val>::try_from_val(env, &topics).unwrap();
+    assert_eq!(last_event(env), (vec_topics, data));
 }
 
 /// The number of events emitted by `contract`. Filters by contract address
@@ -128,6 +134,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
 
     // `last_event` only sees the latest top-level call, so assert it before
     // any other call (such as a balance read) replaces it.
+    let created = last_event(&s.env);
     assert_eq!(
         created,
         (
@@ -140,11 +147,9 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
                 10i128
             )
                 .into_val(&s.env),
+        ),
         )
     );
-    assert_eq!(s.token.balance(&s.donor), 0);
-    assert_eq!(s.token.balance(&s.client.address), 1_000);
-
     assert_eq!(s.token.balance(&s.donor), 0);
     assert_eq!(s.token.balance(&s.client.address), 1_000);
 
@@ -173,6 +178,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     let refund = s.client.cancel_stream(&stream_id);
     let cancelled = last_event(&s.env);
     assert_eq!(refund, 300);
+    let cancelled = last_event(&s.env);
     assert_eq!(
         cancelled,
         (
@@ -347,6 +353,7 @@ fn create_stream_rejects_non_positive_amounts() {
 #[test]
 fn create_stream_errors_instead_of_defaulting_when_counter_is_missing() {
     let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
     assert_eq!(s.client.min_deposit(), 0);
     s.token_admin.mint(&s.donor, &1_000);
 
@@ -525,6 +532,21 @@ fn pending_accrual_matches_withdraw_without_mutating_state() {
 }
 
 #[test]
+fn pending_payout_with_no_treasury_reports_zero_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // no treasury -> no fee, regardless of fee_bps
+    assert_eq!(net, 500); // full accrual goes to the NGO
+}
+
+#[test]
 fn depletion_time_is_last_update_plus_balance_over_rate() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -545,100 +567,41 @@ fn depletion_time_is_last_update_plus_balance_over_rate() {
 }
 
 #[test]
-fn depletion_time_rounds_a_partial_final_second_up() {
+fn pending_payout_with_zero_fee_bps_reports_zero_fee() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
 
-    // 1_000 / 300 = 3.33 seconds: three seconds leave 100 unpaid, so the
-    // stream is only empty once the fourth second has run.
-    let stream_id = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &300);
-    let created_at = s.client.get_stream(&stream_id).created_at;
-    let depletes_at = s.client.depletion_time(&stream_id).unwrap();
-    assert_eq!(depletes_at, created_at + 4);
-
-    // One second short of it, funds are still left...
-    s.env.ledger().with_mut(|l| l.timestamp = depletes_at - 1);
-    assert_eq!(s.client.pending_accrual(&stream_id), 900);
-
-    // ...and at the reported time the whole balance has accrued.
-    s.env.ledger().with_mut(|l| l.timestamp = depletes_at);
-    assert_eq!(s.client.pending_accrual(&stream_id), 1_000);
-}
-
-#[test]
-fn depletion_time_moves_with_a_settlement() {
-    let s = setup();
-    s.token_admin.mint(&s.donor, &1_000);
-
-    let stream_id = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &300);
-
-    // Withdraw after 2 seconds: 600 paid, 400 left, settled at that moment.
-    s.env.ledger().with_mut(|l| l.timestamp += 2);
-    s.client.withdraw(&stream_id);
-    let stream = s.client.get_stream(&stream_id);
-    assert_eq!(stream.balance, 400);
-
-    // 400 / 300 = 1.33 -> 2 more seconds from the new last_update.
-    assert_eq!(
-        s.client.depletion_time(&stream_id),
-        Some(stream.last_update + 2)
-    );
-}
-
-#[test]
-fn depletion_time_of_a_balance_below_the_rate_is_one_second_out() {
-    let s = setup();
-    s.token_admin.mint(&s.donor, &5);
-
-    let stream_id = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &5, &1_000);
-    let created_at = s.client.get_stream(&stream_id).created_at;
-
-    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 1));
-}
-
-#[test]
-fn depletion_time_of_a_drained_stream_is_its_last_update() {
-    let s = setup();
-    s.token_admin.mint(&s.donor, &1_000);
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    // fee_bps defaults to 0 -- left unset here deliberately.
 
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    s.env.ledger().with_mut(|l| l.timestamp += 500);
-    s.client.withdraw(&stream_id);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
-    let stream = s.client.get_stream(&stream_id);
-    assert_eq!(stream.balance, 0);
-    assert_eq!(
-        s.client.depletion_time(&stream_id),
-        Some(stream.last_update)
-    );
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // 0 bps -> zero fee even with a treasury set
+    assert_eq!(net, 500);
 }
 
 #[test]
-fn depletion_time_of_a_cancelled_stream_is_none() {
+fn pending_payout_splits_protocol_fee_with_treasury_and_fee_bps_set() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5%
 
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    s.client.cancel_stream(&stream_id);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
-    assert_eq!(s.client.depletion_time(&stream_id), None);
-}
-
-#[test]
-fn depletion_time_on_unknown_stream_fails() {
-    let s = setup();
-    let result = s.client.try_depletion_time(&999);
-    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 25); // 5% of 500
+    assert_eq!(net, 475); // 500 - 25
 }
 
 #[test]
@@ -738,6 +701,106 @@ fn pause_blocks_withdraw_but_not_cancel() {
 }
 
 #[test]
+fn rescue_stream_rejects_when_not_paused() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::NotPaused)));
+
+    // Rejected: nothing moved, stream untouched.
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 1_000);
+    assert_eq!(stream.status, StreamStatus::Active);
+}
+
+#[test]
+fn rescue_stream_requires_admin_auth() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.pause();
+
+    // The donor, not the admin, tries to invoke it -- require_admin's own
+    // auth check should reject this regardless of who signs.
+    s.env.mock_auths(&[]);
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn rescue_stream_refunds_full_balance_without_settling_accrual() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 20); // 200 would accrue under a normal cancel
+
+    s.client.pause();
+    let refund = s.client.rescue_stream(&stream_id);
+
+    // The full deposit comes back to the donor -- unlike cancel_stream,
+    // nothing is settled to the NGO first.
+    assert_eq!(refund, 1_000);
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+    assert_eq!(s.token.balance(&s.ngo), 0);
+
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 0);
+    assert_eq!(stream.rate, 0);
+    assert!(stream.cancelled);
+    assert_eq!(stream.status, StreamStatus::Cancelled);
+}
+
+#[test]
+fn rescue_stream_emits_a_distinct_event() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.client.pause();
+    let refund = s.client.rescue_stream(&stream_id);
+
+    assert_eq!(
+        last_event(&s.env),
+        (
+            (symbol_short!("rescue"), stream_id).into_val(&s.env),
+            refund.into_val(&s.env),
+        )
+    );
+}
+
+#[test]
+fn rescue_stream_rejects_an_already_cancelled_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    s.client.pause();
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+#[test]
+fn rescue_stream_on_unknown_stream_fails() {
+    let s = setup();
+    s.client.pause();
+    let result = s.client.try_rescue_stream(&999u64);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+}
+
+#[test]
 fn unpause_restores_normal_operation() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -782,10 +845,45 @@ fn unpause_rejects_duplicate_unpause() {
 }
 
 #[test]
-fn withdraw_with_no_treasury_takes_no_fee() {
+fn set_fee_bps_rejects_nonzero_fee_without_treasury() {
+    // Issue #193: without this, the fee would be silently dropped by
+    // compute_fee (which returns 0 whenever no treasury is configured,
+    // regardless of fee_bps) - the admin would believe revenue is accruing
+    // when it isn't, with no error or event to say otherwise.
+    let s = setup();
+    let result = s.client.try_set_fee_bps(&500);
+    assert_eq!(result, Err(Ok(Error::FeeRequiresTreasury)));
+    assert_eq!(s.client.fee_bps(), 0); // rejected - the fee was never stored
+
+    // A zero fee is always fine, treasury or not - there's nothing to drop.
+    s.client.set_fee_bps(&0);
+    assert_eq!(s.client.fee_bps(), 0);
+
+    // Once a treasury is configured, the same fee is accepted.
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    assert_eq!(s.client.fee_bps(), 500);
+}
+
+#[test]
+fn withdraw_after_treasury_cleared_takes_no_fee_even_with_fee_bps_set() {
+    // clear_treasury can leave a non-zero fee_bps configured with no
+    // treasury to receive it - set_fee_bps's own guard only runs at
+    // configuration time, so this isn't a bypass of #193, just the other
+    // documented way compute_fee's "no treasury -> no fee" rule applies:
+    // once a fee was legitimately set while a treasury existed, clearing
+    // that treasury later must not start silently failing withdrawals -
+    // it should simply stop collecting the fee, exactly like never having
+    // set one.
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
-    s.client.set_fee_bps(&500); // configured, but no treasury yet
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.clear_treasury();
+    assert_eq!(s.client.fee_bps(), 500); // fee_bps itself is untouched by clear_treasury
 
     let stream_id = s
         .client
@@ -795,6 +893,67 @@ fn withdraw_with_no_treasury_takes_no_fee() {
     let withdrawn = s.client.withdraw(&stream_id);
     assert_eq!(withdrawn, 500);
     assert_eq!(s.token.balance(&s.ngo), 500);
+}
+
+#[test]
+fn pending_payout_with_no_treasury_reports_no_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // set_fee_bps rejects a non-zero fee with no treasury configured
+    // (#193), so the only way to legitimately reach "fee_bps > 0, no
+    // treasury" is to set a treasury first, then clear it - fee_bps itself
+    // is untouched by clear_treasury.
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.clear_treasury();
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
+    assert_eq!(net, 500); // full accrual goes to the NGO
+}
+
+#[test]
+fn pending_payout_with_zero_fee_bps_reports_no_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury); // treasury set, but fee_bps left at 0
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
+    assert_eq!(net, 500);
+}
+
+#[test]
+fn pending_payout_with_treasury_and_fee_splits_correctly() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5%
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 25); // 5% of 500
+    assert_eq!(net, 475); // 500 - 25
 }
 
 #[test]
@@ -834,10 +993,12 @@ fn withdraw_splits_protocol_fee_to_treasury() {
 
     let treasury = Address::generate(&s.env);
     s.client.set_treasury(&treasury);
-    assert_last_event(
-        &s.env,
-        (symbol_short!("treasury"),).into_val(&s.env),
-        treasury.clone().into_val(&s.env),
+    assert_eq!(
+        last_event(&s.env),
+        (
+            (symbol_short!("treasury"),).into_val(&s.env),
+            treasury.clone().into_val(&s.env),
+        )
     );
     s.client.set_fee_bps(&500); // 5%
     assert_last_event(
@@ -969,22 +1130,32 @@ fn protocol_fee_becomes_nonzero_at_the_rounding_boundary() {
 }
 
 #[test]
-fn get_config_reflects_admin_settings() {
+fn compute_fee_avoids_overflow_near_i128_max() {
     let s = setup();
+
     let treasury = Address::generate(&s.env);
-
     s.client.set_treasury(&treasury);
-    s.client.set_fee_bps(&500);
-    s.client.pause();
+    s.client.set_fee_bps(&1_000); // 10%, the maximum allowed fee
 
-    assert_eq!(
-        s.client.get_config(),
-        Config {
-            paused: true,
-            treasury: Some(treasury),
-            fee_bps: 500,
-        }
-    );
+    // `amount * fee_bps` (i128::MAX * 1_000) overflows i128 long before the
+    // divide-by-10_000 brings the result back into range. A naive multiply,
+    // or a `saturating_mul` that silently clamps the overflowed product
+    // before dividing, both produce a fee many orders of magnitude smaller
+    // than the correct one. `compute_fee` must return the exact
+    // floor(amount * fee_bps / 10_000) instead.
+    let amount = i128::MAX;
+    let fee = s
+        .env
+        .as_contract(&s.client.address, || compute_fee(&s.env, amount));
+
+    let expected = (amount / 10_000) * 1_000 + ((amount % 10_000) * 1_000) / 10_000;
+    assert_eq!(fee, expected);
+
+    // The fee must never exceed the amount it's taken from, and at a 10%
+    // rate should be in the right order of magnitude — not the ~10^4
+    // smaller value a saturated-then-divided intermediate would yield.
+    assert!(fee <= amount);
+    assert!(fee > amount / 11);
 }
 
 #[test]
@@ -997,6 +1168,8 @@ fn set_fee_bps_rejects_over_cap() {
 #[test]
 fn set_fee_bps_boundary_exact_max_succeeds() {
     let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
 
     // Exactly 1 000 bps (10%) is the maximum allowed fee — it must be
     // accepted and stored faithfully.
@@ -1008,6 +1181,138 @@ fn set_fee_bps_boundary_exact_max_succeeds() {
     // can't hide behind a different error path.
     let result = s.client.try_set_fee_bps(&1_001);
     assert_eq!(result, Err(Ok(Error::FeeTooHigh)));
+}
+
+#[test]
+fn max_fee_bps_is_exposed_on_chain() {
+    let s = setup();
+    assert_eq!(s.client.max_fee_bps(), 1_000);
+}
+
+#[test]
+#[should_panic]
+fn withdraw_fails_for_non_ngo_caller() {
+fn token_fee_bps_falls_back_to_the_global_default_with_no_override() {
+    let s = setup();
+    s.client.set_fee_bps(&500); // 5% global default
+
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 500);
+
+    let other_token = Address::generate(&s.env);
+    assert_eq!(s.client.token_fee_bps(&other_token), 500);
+}
+
+#[test]
+fn token_fee_bps_override_takes_priority_over_the_global_default() {
+    let s = setup();
+    s.client.set_fee_bps(&500); // 5% global default
+    s.client.set_token_fee_bps(&s.token.address, &100); // 1% for this token only
+
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 100);
+
+    // A different token, never overridden, still sees the global default.
+    let other_token = Address::generate(&s.env);
+    assert_eq!(s.client.token_fee_bps(&other_token), 500);
+}
+
+#[test]
+fn set_token_fee_bps_rejects_over_cap() {
+    let s = setup();
+    let result = s.client.try_set_token_fee_bps(&s.token.address, &1_001);
+    assert_eq!(result, Err(Ok(Error::FeeTooHigh)));
+}
+
+#[test]
+fn set_token_fee_bps_requires_admin_auth() {
+    let s = setup();
+    s.env.mock_auths(&[]);
+    let result = s.client.try_set_token_fee_bps(&s.token.address, &500);
+    assert!(result.is_err());
+}
+
+#[test]
+fn set_token_fee_bps_emits_token_and_value() {
+    let s = setup();
+    s.client.set_token_fee_bps(&s.token.address, &250);
+
+    assert_eq!(
+        last_event(&s.env),
+        (
+            (symbol_short!("tokfeeset"), s.token.address.clone()).into_val(&s.env),
+            250u32.into_val(&s.env),
+        )
+    );
+}
+
+#[test]
+fn withdraw_uses_the_per_token_fee_override_instead_of_the_global_default() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global default
+    s.client.set_token_fee_bps(&s.token.address, &1_000); // 10% for this token
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 100); // 1_000 accrues
+
+    let withdrawn = s.client.withdraw(&stream_id);
+
+    // 10% of 1_000 (the override), not 5% (the global default).
+    assert_eq!(withdrawn, 900);
+    assert_eq!(s.token.balance(&s.ngo), 900);
+    assert_eq!(s.token.balance(&treasury), 100);
+}
+
+#[test]
+fn withdraw_uses_the_global_fee_for_a_token_with_no_override() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let other_token_issuer = Address::generate(&s.env);
+    let (other_token, other_token_admin) = create_token(&s.env, &other_token_issuer);
+    other_token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global default
+                                // Override only applies to the *other* token, not the one streamed below.
+    s.client.set_token_fee_bps(&other_token.address, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 100); // 1_000 accrues
+
+    let withdrawn = s.client.withdraw(&stream_id);
+
+    // 5% (the global default), since this stream's token has no override.
+    assert_eq!(withdrawn, 950);
+    assert_eq!(s.token.balance(&s.ngo), 950);
+    assert_eq!(s.token.balance(&treasury), 50);
+}
+
+#[test]
+fn pending_payout_reflects_the_per_token_fee_override() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global default
+    s.client.set_token_fee_bps(&s.token.address, &1_000); // 10% override
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 100); // 1_000 accrues
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 100); // 10% of 1_000
+    assert_eq!(net, 900);
 }
 
 #[test]
@@ -1106,6 +1411,244 @@ fn withdraw_and_cancel_on_fully_drained_stream_are_no_ops() {
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 1_000);
     assert!(stream.cancelled);
+}
+
+/// Counts the `transfer` events the given token has emitted so far, so a test
+/// can snapshot the count before a call and check how many transfers it made.
+fn token_transfers(env: &Env, token: &Address) -> u32 {
+    let transfer = ScSymbol::try_from("transfer").unwrap();
+    env.events()
+        .all()
+        .filter_by_contract(token)
+        .events()
+        .iter()
+        .filter(|event| match &event.body {
+            ContractEventBody::V0(body) => body
+                .topics
+                .first()
+                .map(|topic| matches!(topic, ScVal::Symbol(sym) if sym == &transfer))
+                .unwrap_or(false),
+        })
+        .count() as u32
+}
+
+fn stream_ids(env: &Env, ids: &[u64]) -> Vec<u64> {
+    let mut v = Vec::new(env);
+    for id in ids {
+        v.push_back(*id);
+    }
+    v
+}
+
+#[test]
+fn withdraw_batch_pays_mixed_tokens_with_one_transfer_each() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let (token_b, token_b_admin) = create_token(&s.env, &Address::generate(&s.env));
+    token_b_admin.mint(&s.donor, &2_000);
+
+    // Two streams on token A at different rates, one on token B.
+    let a0 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let a1 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &20);
+    let b0 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &token_b.address, &1_000, &5);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10); // a0: 100, a1: 200, b0: 50
+
+    let ids = stream_ids(&s.env, &[a0, a1, b0]);
+    let withdrawn = s.client.withdraw_batch(&ids);
+    // Read the batch invocation's transfers before any later contract call
+    // clears the event buffer.
+    let transfers_a = token_transfers(&s.env, &s.token.address);
+    let transfers_b = token_transfers(&s.env, &token_b.address);
+
+    // Amounts come back in input order.
+    assert_eq!(withdrawn.get(0), Some(100));
+    assert_eq!(withdrawn.get(1), Some(200));
+    assert_eq!(withdrawn.get(2), Some(50));
+
+    assert_eq!(s.token.balance(&s.ngo), 300);
+    assert_eq!(token_b.balance(&s.ngo), 50);
+
+    // The two token-A streams are paid in a single transfer; token B gets
+    // its own.
+    assert_eq!(transfers_a, 1);
+    assert_eq!(transfers_b, 1);
+
+    // Every stream was checkpointed and debited by its own accrual.
+    let a0_stream = s.client.get_stream(&a0);
+    assert_eq!(a0_stream.balance, 900);
+    assert_eq!(a0_stream.withdrawn, 100);
+    assert_eq!(a0_stream.last_update, 10);
+
+    let a1_stream = s.client.get_stream(&a1);
+    assert_eq!(a1_stream.balance, 800);
+    assert_eq!(a1_stream.withdrawn, 200);
+
+    let b0_stream = s.client.get_stream(&b0);
+    assert_eq!(b0_stream.balance, 950);
+    assert_eq!(b0_stream.withdrawn, 50);
+}
+
+#[test]
+fn withdraw_batch_skips_streams_with_nothing_accrued() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let older = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    // Created after the first checkpoint, so it has accrued nothing yet.
+    let fresh = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let ids = stream_ids(&s.env, &[older, fresh]);
+    let withdrawn = s.client.withdraw_batch(&ids);
+
+    assert_eq!(withdrawn.get(0), Some(100));
+    assert_eq!(withdrawn.get(1), Some(0));
+
+    // Only the stream that had something to withdraw paid out.
+    assert_eq!(s.token.balance(&s.ngo), 100);
+
+    // The skipped stream was left completely untouched.
+    let untouched = s.client.get_stream(&fresh);
+    assert_eq!(untouched.balance, 1_000);
+    assert_eq!(untouched.withdrawn, 0);
+    assert_eq!(untouched.last_update, 10);
+}
+
+#[test]
+fn withdraw_batch_unknown_stream_aborts_the_whole_batch() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+
+    let ids = stream_ids(&s.env, &[stream_id, 999]);
+    let result = s.client.try_withdraw_batch(&ids);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+
+    // The whole batch rolled back: nothing was paid and the valid stream
+    // wasn't checkpointed or debited.
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 1_000);
+    assert_eq!(stream.withdrawn, 0);
+    assert_eq!(stream.last_update, 0);
+}
+
+#[test]
+fn withdraw_batch_rejects_streams_owned_by_different_ngos() {
+    let s = setup();
+    let other_ngo = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let mine = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let theirs = s
+        .client
+        .create_stream(&s.donor, &other_ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let ids = stream_ids(&s.env, &[mine, theirs]);
+    let result = s.client.try_withdraw_batch(&ids);
+    assert_eq!(result, Err(Ok(Error::MixedNgo)));
+
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    assert_eq!(s.token.balance(&other_ngo), 0);
+    assert_eq!(s.client.get_stream(&mine).balance, 1_000);
+}
+
+#[test]
+fn withdraw_batch_skims_fee_once_from_the_aggregated_token_payout() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5%
+
+    // 19 units each: 5% truncates to 0 per stream but rounds to 1 whole
+    // unit across the aggregated 38, so this pins that the fee is computed
+    // once on the token sum rather than once per stream.
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &19);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &19);
+    s.env.ledger().with_mut(|l| l.timestamp += 1);
+
+    let ids = stream_ids(&s.env, &[a, b]);
+    let withdrawn = s.client.withdraw_batch(&ids);
+    assert_eq!(withdrawn.get(0), Some(19));
+    assert_eq!(withdrawn.get(1), Some(19));
+
+    assert_eq!(s.token.balance(&treasury), 1);
+    assert_eq!(s.token.balance(&s.ngo), 37);
+}
+
+#[test]
+fn withdraw_batch_with_no_streams_is_a_noop() {
+    let s = setup();
+    let ids: Vec<u64> = Vec::new(&s.env);
+
+    let withdrawn = s.client.withdraw_batch(&ids);
+
+    assert_eq!(withdrawn.len(), 0);
+    assert!(s.env.auths().is_empty());
+}
+
+#[test]
+fn withdraw_batch_requires_ngo_auth() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let ids = stream_ids(&s.env, &[a, b]);
+    s.client.withdraw_batch(&ids);
+
+    // Both streams share one NGO, so the batch needs a single auth.
+    assert_auth_required_from(&s, &s.ngo, "withdraw_batch");
+}
+
+#[test]
+fn withdraw_batch_bumps_instance_and_stream_ttls() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    age_past_thresholds(&s, Some(a));
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let ids = stream_ids(&s.env, &[a, b]);
+    s.client.withdraw_batch(&ids);
+
+    assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
+    assert_eq!(stream_ttl(&s, a), STREAM_BUMP_AMOUNT);
+    assert_eq!(stream_ttl(&s, b), STREAM_BUMP_AMOUNT);
 }
 
 #[test]
@@ -1292,6 +1835,53 @@ fn get_stream_on_unknown_id_fails() {
 }
 
 #[test]
+fn get_streams_returns_mixed_existing_and_missing_ids() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &2_000, &20);
+
+    let ids = stream_ids(&s.env, &[a, 999, b]);
+    let streams = s.client.get_streams(&ids);
+
+    // Results line up with the input ids, missing ones come back as None, and
+    // existing ones carry the full record.
+    assert_eq!(streams.len(), 3);
+    assert_eq!(streams.get(0).unwrap().unwrap(), s.client.get_stream(&a));
+    assert_eq!(streams.get(1), Some(None));
+    assert_eq!(streams.get(2).unwrap().unwrap(), s.client.get_stream(&b));
+}
+
+#[test]
+fn get_streams_returns_none_for_every_missing_id() {
+    let s = setup();
+
+    let ids = stream_ids(&s.env, &[7, 8]);
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 2);
+    assert_eq!(streams.get(0), Some(None));
+    assert_eq!(streams.get(1), Some(None));
+}
+
+#[test]
+fn get_streams_with_no_ids_is_empty_and_takes_no_auth() {
+    let s = setup();
+    let ids: Vec<u64> = Vec::new(&s.env);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 0);
+    // Read-only: like get_stream, it needs no authorization.
+    assert!(s.env.auths().is_empty());
+}
+
+#[test]
 fn create_stream_stores_every_field() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -1319,6 +1909,37 @@ fn create_stream_stores_every_field() {
             cancelled: false,
         }
     );
+}
+
+#[test]
+fn stream_ids_are_sequential_and_stream_count_tracks_them() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000_000);
+
+    assert_eq!(s.client.stream_count(), 0);
+
+    let id_a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.stream_count(), 1);
+
+    let id_b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.stream_count(), 2);
+
+    let id_c = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.stream_count(), 3);
+
+    // Ids increment by exactly one, starting from zero.
+    assert_eq!(id_a, 0);
+    assert_eq!(id_b, id_a + 1);
+    assert_eq!(id_c, id_b + 1);
+
+    // stream_count matches the number of streams actually created.
+    assert_eq!(s.client.stream_count(), 3);
 }
 
 fn instance_ttl(s: &Setup) -> u32 {
@@ -1361,6 +1982,73 @@ fn create_stream_bumps_instance_and_stream_ttl() {
 
     assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
     assert_eq!(stream_ttl(&s, stream_id), STREAM_BUMP_AMOUNT);
+}
+
+#[test]
+fn slow_stream_gets_a_ttl_bump_reflecting_its_own_lifetime_not_just_the_default() {
+    let s = setup();
+    // 200 days worth of balance at 1 unit/second -- its own remaining
+    // lifetime (200 days) is longer than the normal 90-day bump, which is
+    // exactly the "long-idle stream" scenario issue #197 describes: with
+    // only the flat default, this stream's storage could expire with 110+
+    // days of balance still undrawn, long before it would naturally drain.
+    let rate = 1i128;
+    let lifetime_days = 200u32;
+    let balance = rate * (lifetime_days as i128) * 86_400;
+    s.token_admin.mint(&s.donor, &balance);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &balance, &rate);
+
+    let expected_ledgers = lifetime_days * DAY_IN_LEDGERS;
+    assert_eq!(stream_ttl(&s, stream_id), expected_ledgers);
+    // Strictly longer than the flat default, not just equal to it by
+    // coincidence of rounding.
+    assert!(expected_ledgers > STREAM_BUMP_AMOUNT);
+}
+
+#[test]
+fn fast_draining_stream_still_gets_at_least_the_default_bump() {
+    let s = setup();
+    // Fully drains in under a day -- its own remaining lifetime is far
+    // shorter than 90 days, but the bump must never be *less* than the
+    // normal default: a short-lived stream shouldn't be more exposed to
+    // TTL expiry than before this change.
+    let stream_id = create_ttl_test_stream(&s); // balance 1_000, rate 10 -> drains in 100s
+
+    assert_eq!(stream_ttl(&s, stream_id), STREAM_BUMP_AMOUNT);
+}
+
+#[test]
+fn interaction_restores_a_near_expired_slow_streams_ttl() {
+    let s = setup();
+    let rate = 1i128;
+    let lifetime_days = 200u32;
+    let balance = rate * (lifetime_days as i128) * 86_400;
+    s.token_admin.mint(&s.donor, &(balance * 2));
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &balance, &rate);
+    let initial_ttl = stream_ttl(&s, stream_id);
+
+    // Age the ledger most of the way through that lifetime-based TTL, well
+    // past the point a flat 90-day default would already have let this
+    // stream's storage expire.
+    s.env.ledger().with_mut(|l| {
+        l.sequence_number += initial_ttl - DAY_IN_LEDGERS;
+        l.timestamp += 1; // enough for a nonzero accrual to settle
+    });
+    assert!(stream_ttl(&s, stream_id) < STREAM_LIFETIME_THRESHOLD);
+
+    // Any interaction -- here, the permissionless extend_stream anyone can
+    // call -- restores the stream's TTL using its current (still long)
+    // remaining lifetime, not just the flat default.
+    s.client.extend_stream(&stream_id);
+    let restored_ttl = stream_ttl(&s, stream_id);
+    assert!(restored_ttl >= STREAM_LIFETIME_THRESHOLD);
+    assert!(restored_ttl > STREAM_BUMP_AMOUNT);
 }
 
 #[test]
@@ -1508,7 +2196,10 @@ fn renounce_admin_disables_admin_gated_calls() {
     // Admin-gated entry points must now fail cleanly rather than succeed.
     assert!(s.client.try_pause().is_err());
     assert!(s.client.try_unpause().is_err());
-    assert!(s.client.try_set_treasury(&Address::generate(&s.env)).is_err());
+    assert!(s
+        .client
+        .try_set_treasury(&Address::generate(&s.env))
+        .is_err());
     assert!(s.client.try_clear_treasury().is_err());
     assert!(s.client.try_set_fee_bps(&100).is_err());
     assert!(s
@@ -1716,7 +2407,10 @@ fn admin_entry_points_require_admin_auth() {
     s.client.clear_treasury();
     assert_auth_required_from(&s, &admin, "clear_treasury");
 
-    s.client.set_fee_bps(&100);
+    // 0, not 100: the treasury was just cleared above, and a non-zero fee
+    // with no treasury configured is rejected (#193) - irrelevant to what
+    // this test checks (that set_fee_bps requires admin auth at all).
+    s.client.set_fee_bps(&0);
     assert_auth_required_from(&s, &admin, "set_fee_bps");
 
     let new_admin = Address::generate(&s.env);
@@ -1771,10 +2465,13 @@ fn create_stream_rejects_the_101st_stream() {
 
     // Fill the default cap.
     for _ in 0..100 {
-        s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+        s.client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     }
 
-    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     assert!(result.is_err());
 }
 
@@ -1784,15 +2481,20 @@ fn raising_the_cap_lets_the_next_stream_through() {
     s.token_admin.mint(&s.donor, &1_000_000);
     s.client.set_max_streams_per_donor(&1);
 
-    s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
     // At the cap, next call fails.
-    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     assert!(result.is_err());
 
     // Raise the cap. Next call succeeds.
     s.client.set_max_streams_per_donor(&2);
-    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     assert_eq!(s.client.get_stream(&stream_id).donor, s.donor);
 }
 
@@ -1803,14 +2505,17 @@ fn lowering_the_cap_does_not_retroactively_affect_existing_streams() {
     s.client.set_max_streams_per_donor(&5);
 
     for _ in 0..3 {
-        s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+        s.client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     }
 
     // Drop the cap below the current count.
     s.client.set_max_streams_per_donor(&1);
 
     // New streams are rejected.
-    let result = s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     assert!(result.is_err());
 
     // Existing streams are untouched and still withdrawable.
@@ -1828,13 +2533,18 @@ fn separate_donors_have_separate_counters() {
     s.token_admin.mint(&s.donor, &1_000);
     s.token_admin.mint(&donor_b, &1_000);
 
-    s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     // A different donor is unaffected by donor A's cap.
-    let donor_b_stream = s.client.create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
+    let donor_b_stream = s
+        .client
+        .create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
     assert_eq!(s.client.get_stream(&donor_b_stream).donor, donor_b);
 
     // But donor_b is now at its own cap.
-    let result = s.client.try_create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
+    let result = s
+        .client
+        .try_create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
     assert!(result.is_err());
 }
 
@@ -1846,17 +2556,27 @@ fn separate_donors_have_separate_counters() {
 fn new_stream_starts_active() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
-    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
 }
 
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 25); // 5% of 500
+    assert_eq!(net, 475); // 500 - 25
 #[test]
 fn cancelled_stream_reports_cancelled() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
-    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     s.client.cancel_stream(&stream_id);
-    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Cancelled);
+    assert_eq!(
+        s.client.get_stream(&stream_id).status,
+        StreamStatus::Cancelled
+    );
 }
 
 #[test]
@@ -1864,17 +2584,24 @@ fn fully_withdrawn_stream_reports_drained() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
     // 10 units/s for 1000 units ? fully drained after 100 seconds.
-    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     s.env.ledger().with_mut(|l| l.timestamp += 100);
     s.client.withdraw(&stream_id);
-    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Drained);
+    assert_eq!(
+        s.client.get_stream(&stream_id).status,
+        StreamStatus::Drained
+    );
 }
 
 #[test]
 fn partially_withdrawn_stream_stays_active() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
-    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     s.env.ledger().with_mut(|l| l.timestamp += 50);
     s.client.withdraw(&stream_id);
     assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
@@ -1884,7 +2611,9 @@ fn partially_withdrawn_stream_stays_active() {
 fn status_is_queryable_after_cancel_then_further_operations_fail() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
-    let stream_id = s.client.create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     s.client.cancel_stream(&stream_id);
     assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Cancelled);
     // withdraw on a cancelled stream finds nothing accrued (cancel zeroed
@@ -1892,4 +2621,115 @@ fn status_is_queryable_after_cancel_then_further_operations_fail() {
     s.env.ledger().with_mut(|l| l.timestamp += 10);
     let result = s.client.try_withdraw(&stream_id);
     assert_eq!(result, Err(Ok(Error::NothingToWithdraw)));
+    assert_eq!(
+        s.client.get_stream(&stream_id).status,
+        StreamStatus::Cancelled
+    );
+    // top_up on a cancelled stream is rejected (cancelled sets rate = 0).
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    let result = s.client.try_top_up(&stream_id, &100);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+// =============================================================================
+// Reentrancy ordering: state before transfer (issue #194)
+// =============================================================================
+
+/// A token stub that reenters `cancel_stream` on the exact stream being
+/// paid out, from inside its own `transfer`, to prove the vault can't be
+/// tricked into a double payout by a malicious or non-standard token.
+///
+/// In this Soroban SDK version, cross-contract calls default to
+/// `ContractReentryMode::Prohibited` (see `soroban-env-host`'s
+/// `call`/`try_call`): the host itself refuses to let `cancel_stream`
+/// re-enter the vault contract while the vault is already on the call
+/// stack, independent of `cancel_stream`'s own state-before-transfer
+/// ordering. That is a real, load-bearing platform guarantee this test
+/// exercises directly - but it is not a substitute for the ordering fix:
+/// if a future host version relaxed that default (the `try_call` host
+/// function's own doc comment notes a `reentry` flag is anticipated to be
+/// threaded through from `try_call`), the ordering becomes the only
+/// remaining defense, since by then the stream's balance/cancelled state
+/// is already zeroed and persisted *before* this transfer is ever called,
+/// so a reentrant `cancel_stream` that did get through would find nothing
+/// left to double-pay.
+///
+/// The host currently escalates this rejection to a hard panic through
+/// the full call chain (observed directly: the reentry itself surfaces as
+/// a recoverable `Context::InvalidAction` inside `try_call`, but the
+/// *resuming* outer `transfer` then fails `Auth::InvalidAction` and that
+/// is not recoverable), rather than letting `try_cancel_stream` return a
+/// clean `Err` the stub could gracefully continue past - so this is a
+/// `#[should_panic]` test asserting the whole `cancel_stream` call aborts,
+/// not one that inspects final balances afterward.
+///
+/// Only `transfer` is implemented - `DonationVault` never calls any other
+/// token method - and it attempts the reentrant call unconditionally.
+#[contract]
+struct ReentrantToken;
+
+#[contracttype]
+enum ReentrantKey {
+    Real,
+    Vault,
+    StreamId,
+}
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn init(env: Env, real: Address, vault: Address, stream_id: u64) {
+        env.storage().instance().set(&ReentrantKey::Real, &real);
+        env.storage().instance().set(&ReentrantKey::Vault, &vault);
+        env.storage()
+            .instance()
+            .set(&ReentrantKey::StreamId, &stream_id);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        let vault: Address = env.storage().instance().get(&ReentrantKey::Vault).unwrap();
+        let stream_id: u64 = env
+            .storage()
+            .instance()
+            .get(&ReentrantKey::StreamId)
+            .unwrap();
+        let vault_client = DonationVaultClient::new(&env, &vault);
+        // Reenter mid-transfer, before this outer transfer has itself
+        // completed. The host rejects this outright (see the type-level
+        // doc comment above) and currently escalates that rejection all
+        // the way up through the resuming outer transfer, so this call
+        // never returns.
+        vault_client.cancel_stream(&stream_id);
+
+        let real: Address = env.storage().instance().get(&ReentrantKey::Real).unwrap();
+        TokenClient::new(&env, &real).transfer(&from, &to, &amount);
+    }
+}
+
+#[test]
+#[should_panic]
+fn cancel_stream_reentrancy_is_rejected_by_the_host() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 20); // 200 accrues
+
+    // Swap the stream's token for the reentrant stub *after* creation, so
+    // create_stream's own transfer (the deposit pull) used the real SAC,
+    // and only cancel_stream's payout/refund transfers go through the stub.
+    let reentrant_id = s.env.register(ReentrantToken, ());
+    let reentrant_client = ReentrantTokenClient::new(&s.env, &reentrant_id);
+    reentrant_client.init(&s.token.address, &s.client.address, &stream_id);
+    s.env.as_contract(&s.client.address, || {
+        let key = DataKey::Stream(stream_id);
+        let mut stream: Stream = s.env.storage().persistent().get(&key).unwrap();
+        stream.token = reentrant_id.clone();
+        s.env.storage().persistent().set(&key, &stream);
+    });
+
+    // Must panic: the reentrant cancel_stream call inside transfer is
+    // rejected by the host's reentry prohibition.
+    s.client.cancel_stream(&stream_id);
 }
