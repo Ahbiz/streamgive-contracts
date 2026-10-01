@@ -7,7 +7,7 @@ use soroban_sdk::testutils::{
     Address as _, AuthorizedFunction, Events as _, Ledger, MockAuth, MockAuthInvoke,
 };
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-use soroban_sdk::xdr::{ContractEventBody, ScVal, ScVec};
+use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal, ScVec};
 use soroban_sdk::{IntoVal, Symbol, TryFromVal, Val, Vec};
 
 /// The most recently published event, in XDR form. `Val` has no `PartialEq`,
@@ -117,10 +117,6 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    // Capture the event before any other contract call: the SDK only exposes
-    // the events of the most recent invocation.
-    let created = last_event(&s.env);
-
     // `last_event` only sees the latest top-level call, so assert it before
     // any other call (such as a balance read) replaces it.
     let created = last_event(&s.env);
@@ -138,9 +134,6 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
                 .into_val(&s.env),
         )
     );
-    assert_eq!(s.token.balance(&s.donor), 0);
-    assert_eq!(s.token.balance(&s.client.address), 1_000);
-
     assert_eq!(s.token.balance(&s.donor), 0);
     assert_eq!(s.token.balance(&s.client.address), 1_000);
 
@@ -522,7 +515,6 @@ fn pending_accrual_matches_withdraw_without_mutating_state() {
 
 #[test]
 fn pending_payout_with_no_treasury_reports_zero_fee() {
-fn depletion_time_is_last_update_plus_balance_over_rate() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
 
@@ -534,6 +526,26 @@ fn depletion_time_is_last_update_plus_balance_over_rate() {
     let (net, fee) = s.client.pending_payout(&stream_id);
     assert_eq!(fee, 0); // no treasury -> no fee, regardless of fee_bps
     assert_eq!(net, 500); // full accrual goes to the NGO
+}
+
+#[test]
+fn depletion_time_is_last_update_plus_balance_over_rate() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let created_at = s.client.get_stream(&stream_id).created_at;
+
+    // 1_000 at 10/s divides evenly: exactly 100 seconds.
+    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 100));
+
+    // Nothing is settled by just asking, and the answer doesn't drift as
+    // time passes without a settlement.
+    s.env.ledger().with_mut(|l| l.timestamp += 30);
+    assert_eq!(s.client.depletion_time(&stream_id), Some(created_at + 100));
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
 }
 
 #[test]
@@ -1691,6 +1703,53 @@ fn get_stream_on_unknown_id_fails() {
 }
 
 #[test]
+fn get_streams_returns_mixed_existing_and_missing_ids() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &2_000, &20);
+
+    let ids = stream_ids(&s.env, &[a, 999, b]);
+    let streams = s.client.get_streams(&ids);
+
+    // Results line up with the input ids, missing ones come back as None, and
+    // existing ones carry the full record.
+    assert_eq!(streams.len(), 3);
+    assert_eq!(streams.get(0).unwrap().unwrap(), s.client.get_stream(&a));
+    assert_eq!(streams.get(1), Some(None));
+    assert_eq!(streams.get(2).unwrap().unwrap(), s.client.get_stream(&b));
+}
+
+#[test]
+fn get_streams_returns_none_for_every_missing_id() {
+    let s = setup();
+
+    let ids = stream_ids(&s.env, &[7, 8]);
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 2);
+    assert_eq!(streams.get(0), Some(None));
+    assert_eq!(streams.get(1), Some(None));
+}
+
+#[test]
+fn get_streams_with_no_ids_is_empty_and_takes_no_auth() {
+    let s = setup();
+    let ids: Vec<u64> = Vec::new(&s.env);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 0);
+    // Read-only: like get_stream, it needs no authorization.
+    assert!(s.env.auths().is_empty());
+}
+
+#[test]
 fn create_stream_stores_every_field() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -1974,7 +2033,10 @@ fn renounce_admin_disables_admin_gated_calls() {
     // Admin-gated entry points must now fail cleanly rather than succeed.
     assert!(s.client.try_pause().is_err());
     assert!(s.client.try_unpause().is_err());
-    assert!(s.client.try_set_treasury(&Address::generate(&s.env)).is_err());
+    assert!(s
+        .client
+        .try_set_treasury(&Address::generate(&s.env))
+        .is_err());
     assert!(s.client.try_clear_treasury().is_err());
     assert!(s.client.try_set_fee_bps(&100).is_err());
     assert!(s
