@@ -10,7 +10,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
-    Vec,
+    Map, Vec,
 };
 
 mod math;
@@ -107,6 +107,10 @@ pub enum Error {
     /// leave its type's range. Returned instead of letting the release
     /// profile's overflow checks panic and abort the transaction.
     ArithmeticOverflow = 9,
+    /// A stream's `balance` or `withdrawn` (or the stream-id counter) would
+    /// leave its type's range. Returned instead of letting the release
+    /// profile's overflow checks panic and abort the transaction.
+    ArithmeticOverflow = 9,
     /// `deposit` was below the configured `min_deposit`.
     DepositTooLow = 10,
     AlreadyPaused = 11,
@@ -136,7 +140,11 @@ pub enum Error {
     NotPaused = 19,
     /// The admin has renounced control, so admin-gated calls are permanently
     /// disabled.
-    AdminRenounced = 16,
+    AdminRenounced = 20,
+    /// `withdraw_batch` was handed streams that don't all belong to the same
+    /// NGO. Payouts are aggregated per token, so a single batch can only ever
+    /// pay one NGO.
+    MixedNgo = 21,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -1444,6 +1452,125 @@ impl DonationVault {
             .publish((symbol_short!("withdraw"), stream_id), accrued);
 
         Ok(net)
+    }
+
+    /// Withdraws from several streams in a single transaction, settling each
+    /// one exactly as `withdraw` would but aggregating the gross accruals per
+    /// token so the vault makes only one transfer per token regardless of how
+    /// many streams contributed to it.
+    ///
+    /// Every stream must belong to the same NGO, which authorizes the call
+    /// once. Streams that have accrued nothing since their last checkpoint
+    /// are skipped so an NGO can pass its full stream list without filtering
+    /// it first; a stream id that doesn't exist (or an arithmetic overflow)
+    /// aborts the whole batch atomically. The protocol fee is skimmed from
+    /// the aggregated per-token amount, not per stream.
+    ///
+    /// Returns the gross accrued amount for each input stream, in the same
+    /// order as `stream_ids` (0 for a stream that had nothing to withdraw).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env, Vec};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &2_000);
+    /// let a = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// let b = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// env.ledger().with_mut(|l| l.timestamp += 50);
+    ///
+    /// let mut ids = Vec::new(&env);
+    /// ids.push_back(a);
+    /// ids.push_back(b);
+    /// // 500 accrued on each, paid out to the NGO in one token transfer.
+    /// let withdrawn = client.withdraw_batch(&ids);
+    /// assert_eq!(withdrawn.get(0), Some(500));
+    /// assert_eq!(withdrawn.get(1), Some(500));
+    /// ```
+    pub fn withdraw_batch(env: Env, stream_ids: Vec<u64>) -> Result<Vec<i128>, Error> {
+        require_not_paused(&env)?;
+
+        let now = env.ledger().timestamp();
+        let mut ngo: Option<Address> = None;
+        let mut amounts: Vec<i128> = Vec::new(&env);
+        let mut payouts: Map<Address, i128> = Map::new(&env);
+
+        for stream_id in stream_ids.iter() {
+            let key = DataKey::Stream(stream_id);
+            let mut stream: Stream = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(Error::StreamNotFound)?;
+
+            // Every stream in a batch has to share one NGO: the payouts are
+            // summed per token and sent to a single address, so a batch that
+            // mixed NGOs would silently pay the first one for the others'
+            // streams. Requiring the NGO's auth here also stops a caller from
+            // draining streams that aren't theirs.
+            match &ngo {
+                None => {
+                    stream.ngo.require_auth();
+                    ngo = Some(stream.ngo.clone());
+                }
+                Some(existing) if existing != &stream.ngo => return Err(Error::MixedNgo),
+                Some(_) => {}
+            }
+
+            let elapsed = now.saturating_sub(stream.last_update);
+            let accrued = math::accrued(stream.rate, elapsed, stream.balance);
+            amounts.push_back(accrued);
+
+            if accrued <= 0 {
+                continue;
+            }
+
+            record_payout(&mut stream, accrued)?;
+            stream.last_update = now;
+            env.storage().persistent().set(&key, &stream);
+            extend_stream_ttl(&env, stream_id);
+
+            let total = payouts.get(stream.token.clone()).unwrap_or(0);
+            payouts.set(
+                stream.token.clone(),
+                total
+                    .checked_add(accrued)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
+        }
+
+        if let Some(ngo) = ngo {
+            extend_instance_ttl(&env);
+
+            // One transfer (and at most one fee transfer) per token, rather
+            // than one per stream.
+            for (token, gross) in payouts.iter() {
+                let token_client = token::Client::new(&env, &token);
+                pay_ngo(&env, &token_client, &ngo, gross);
+            }
+        }
+
+        // Emit a `withdraw` per contributing stream, matching `withdraw`'s
+        // topics and data so the indexer needs no batch-specific handling.
+        for (stream_id, accrued) in stream_ids.iter().zip(amounts.iter()) {
+            if accrued > 0 {
+                env.events()
+                    .publish((symbol_short!("withdraw"), stream_id), accrued);
+            }
+        }
+
+        Ok(amounts)
     }
 
     /// Stops a stream for good: settles whatever has already accrued to the

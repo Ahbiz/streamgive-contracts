@@ -117,6 +117,9 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    // Capture the event before any other contract call: the SDK only exposes
+    // the events of the most recent invocation.
+    let created = last_event(&s.env);
 
     // `last_event` only sees the latest top-level call, so assert it before
     // any other call (such as a balance read) replaces it.
@@ -1264,6 +1267,244 @@ fn withdraw_and_cancel_on_fully_drained_stream_are_no_ops() {
     assert_eq!(stream.rate, 0);
     assert_eq!(stream.withdrawn, 1_000);
     assert!(stream.cancelled);
+}
+
+/// Counts the `transfer` events the given token has emitted so far, so a test
+/// can snapshot the count before a call and check how many transfers it made.
+fn token_transfers(env: &Env, token: &Address) -> u32 {
+    let transfer = ScSymbol::try_from("transfer").unwrap();
+    env.events()
+        .all()
+        .filter_by_contract(token)
+        .events()
+        .iter()
+        .filter(|event| match &event.body {
+            ContractEventBody::V0(body) => body
+                .topics
+                .first()
+                .map(|topic| matches!(topic, ScVal::Symbol(sym) if sym == &transfer))
+                .unwrap_or(false),
+        })
+        .count() as u32
+}
+
+fn stream_ids(env: &Env, ids: &[u64]) -> Vec<u64> {
+    let mut v = Vec::new(env);
+    for id in ids {
+        v.push_back(*id);
+    }
+    v
+}
+
+#[test]
+fn withdraw_batch_pays_mixed_tokens_with_one_transfer_each() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let (token_b, token_b_admin) = create_token(&s.env, &Address::generate(&s.env));
+    token_b_admin.mint(&s.donor, &2_000);
+
+    // Two streams on token A at different rates, one on token B.
+    let a0 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let a1 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &20);
+    let b0 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &token_b.address, &1_000, &5);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10); // a0: 100, a1: 200, b0: 50
+
+    let ids = stream_ids(&s.env, &[a0, a1, b0]);
+    let withdrawn = s.client.withdraw_batch(&ids);
+    // Read the batch invocation's transfers before any later contract call
+    // clears the event buffer.
+    let transfers_a = token_transfers(&s.env, &s.token.address);
+    let transfers_b = token_transfers(&s.env, &token_b.address);
+
+    // Amounts come back in input order.
+    assert_eq!(withdrawn.get(0), Some(100));
+    assert_eq!(withdrawn.get(1), Some(200));
+    assert_eq!(withdrawn.get(2), Some(50));
+
+    assert_eq!(s.token.balance(&s.ngo), 300);
+    assert_eq!(token_b.balance(&s.ngo), 50);
+
+    // The two token-A streams are paid in a single transfer; token B gets
+    // its own.
+    assert_eq!(transfers_a, 1);
+    assert_eq!(transfers_b, 1);
+
+    // Every stream was checkpointed and debited by its own accrual.
+    let a0_stream = s.client.get_stream(&a0);
+    assert_eq!(a0_stream.balance, 900);
+    assert_eq!(a0_stream.withdrawn, 100);
+    assert_eq!(a0_stream.last_update, 10);
+
+    let a1_stream = s.client.get_stream(&a1);
+    assert_eq!(a1_stream.balance, 800);
+    assert_eq!(a1_stream.withdrawn, 200);
+
+    let b0_stream = s.client.get_stream(&b0);
+    assert_eq!(b0_stream.balance, 950);
+    assert_eq!(b0_stream.withdrawn, 50);
+}
+
+#[test]
+fn withdraw_batch_skips_streams_with_nothing_accrued() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let older = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    // Created after the first checkpoint, so it has accrued nothing yet.
+    let fresh = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let ids = stream_ids(&s.env, &[older, fresh]);
+    let withdrawn = s.client.withdraw_batch(&ids);
+
+    assert_eq!(withdrawn.get(0), Some(100));
+    assert_eq!(withdrawn.get(1), Some(0));
+
+    // Only the stream that had something to withdraw paid out.
+    assert_eq!(s.token.balance(&s.ngo), 100);
+
+    // The skipped stream was left completely untouched.
+    let untouched = s.client.get_stream(&fresh);
+    assert_eq!(untouched.balance, 1_000);
+    assert_eq!(untouched.withdrawn, 0);
+    assert_eq!(untouched.last_update, 10);
+}
+
+#[test]
+fn withdraw_batch_unknown_stream_aborts_the_whole_batch() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
+
+    let ids = stream_ids(&s.env, &[stream_id, 999]);
+    let result = s.client.try_withdraw_batch(&ids);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+
+    // The whole batch rolled back: nothing was paid and the valid stream
+    // wasn't checkpointed or debited.
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 1_000);
+    assert_eq!(stream.withdrawn, 0);
+    assert_eq!(stream.last_update, 0);
+}
+
+#[test]
+fn withdraw_batch_rejects_streams_owned_by_different_ngos() {
+    let s = setup();
+    let other_ngo = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let mine = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let theirs = s
+        .client
+        .create_stream(&s.donor, &other_ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let ids = stream_ids(&s.env, &[mine, theirs]);
+    let result = s.client.try_withdraw_batch(&ids);
+    assert_eq!(result, Err(Ok(Error::MixedNgo)));
+
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    assert_eq!(s.token.balance(&other_ngo), 0);
+    assert_eq!(s.client.get_stream(&mine).balance, 1_000);
+}
+
+#[test]
+fn withdraw_batch_skims_fee_once_from_the_aggregated_token_payout() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5%
+
+    // 19 units each: 5% truncates to 0 per stream but rounds to 1 whole
+    // unit across the aggregated 38, so this pins that the fee is computed
+    // once on the token sum rather than once per stream.
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &19);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &19);
+    s.env.ledger().with_mut(|l| l.timestamp += 1);
+
+    let ids = stream_ids(&s.env, &[a, b]);
+    let withdrawn = s.client.withdraw_batch(&ids);
+    assert_eq!(withdrawn.get(0), Some(19));
+    assert_eq!(withdrawn.get(1), Some(19));
+
+    assert_eq!(s.token.balance(&treasury), 1);
+    assert_eq!(s.token.balance(&s.ngo), 37);
+}
+
+#[test]
+fn withdraw_batch_with_no_streams_is_a_noop() {
+    let s = setup();
+    let ids: Vec<u64> = Vec::new(&s.env);
+
+    let withdrawn = s.client.withdraw_batch(&ids);
+
+    assert_eq!(withdrawn.len(), 0);
+    assert!(s.env.auths().is_empty());
+}
+
+#[test]
+fn withdraw_batch_requires_ngo_auth() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let ids = stream_ids(&s.env, &[a, b]);
+    s.client.withdraw_batch(&ids);
+
+    // Both streams share one NGO, so the batch needs a single auth.
+    assert_auth_required_from(&s, &s.ngo, "withdraw_batch");
+}
+
+#[test]
+fn withdraw_batch_bumps_instance_and_stream_ttls() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    age_past_thresholds(&s, Some(a));
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let ids = stream_ids(&s.env, &[a, b]);
+    s.client.withdraw_batch(&ids);
+
+    assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
+    assert_eq!(stream_ttl(&s, a), STREAM_BUMP_AMOUNT);
+    assert_eq!(stream_ttl(&s, b), STREAM_BUMP_AMOUNT);
 }
 
 #[test]

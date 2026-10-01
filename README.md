@@ -9,7 +9,7 @@ donation flows end to end — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Contracts
 
 - `ngo-registry` — on-chain NGO application, verification, and registry
-- `donation-vault` — streaming donation vault (create / withdraw / cancel / modify streams)
+- `donation-vault` — streaming donation vault (create / withdraw / batch-withdraw / cancel / modify streams)
 
 ## Release profile
 
@@ -44,12 +44,12 @@ where it was and there is nothing to unwind when the pause is lifted.
 While the vault is paused, every entry point that moves tokens or changes
 a stream rejects the call with `Error::ContractPaused` (code 6) before
 touching storage or requiring any auth:
+
 Note that pausing does **not** stop time-based accrual. A stream's
 `pending_accrual` keeps growing while the vault is paused, so a stream
 paused for a week still owes a week of accrual once the pause is lifted.
 That accrual is claimable via `withdraw` as soon as the vault is
 unpaused.
-
 
 | Entry point     | While paused                                    |
 | --------------- | ----------------------------------------------- |
@@ -58,7 +58,6 @@ unpaused.
 | `top_up`        | Rejected                                        |
 | `modify_rate`   | Rejected                                        |
 | `cancel_stream` | Still works — settles and refunds as usual      |
-
 
 `withdraw` being on that list is the point of the brake: it is the only
 path that pays tokens straight out of the vault, so a pause triggered by a
@@ -84,142 +83,3 @@ Run the full test suite for all contracts from the workspace root:
 
 ```sh
 cargo test --workspace
-```
-
-To run tests for a single contract:
-
-```sh
-cargo test -p donation-vault
-cargo test -p ngo-registry
-```
-
-Notable coverage:
-
-- `donation-vault`'s `math` module unit-tests the streaming accrual
-  calculation (`accrued`) directly: zero/negative rate, zero balance,
-  zero elapsed time, capping at the remaining balance, and saturating
-  instead of overflowing/panicking near `i128::MAX`.
-- It also includes a deterministic grid-based invariant sweep
-  (`invariants_hold_across_a_grid_of_inputs`) that checks, across a
-  matrix of rates, balances, and elapsed durations, that accrual is
-  always non-negative, never exceeds the remaining balance, and is
-  monotonically non-decreasing as elapsed time (or rate) grows — a
-  stand-in for property-based testing over the streaming math's edge
-  cases.
-
-CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
-`cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
-build, a wasm binary size check (see
-[`scripts/check-wasm-size.sh`](scripts/check-wasm-size.sh)), and
-`cargo test --workspace` on every push and pull request.
-
-## FAQ
-
-### Why is this project licensed under Apache-2.0?
-
-Apache-2.0 permits reuse and modification while providing an explicit patent
-license and clear contributor protections. That makes it a practical default
-for contracts intended to be integrated by wallets, applications, and other
-open-source projects.
-
-### Why are release overflow checks enabled?
-
-The contracts move token balances and calculate payouts with `i128`. A wrapped
-balance could silently corrupt funds, so release builds keep `overflow-checks`
-enabled and return explicit arithmetic errors where the contract can handle
-the failure.
-
-### Why are the contracts `no_std`?
-
-Soroban contracts run in a constrained WebAssembly environment. `no_std`
-keeps the deployed artifact small and avoids bringing operating-system
-facilities that are unavailable on-chain.
-
-### Why does each stream have its own TTL?
-
-Persistent storage is retained per key. A stream that is never touched can
-expire independently of the vault instance, so state-changing calls and the
-permissionless `extend_stream` entry point refresh the specific stream that
-needs to remain available.
-
-**Risk: a long-idle stream can still expire and lock its funds** (issue
-#197). A stream nobody interacts with — a slow trickle where neither the
-donor tops it up nor the NGO withdraws from it, and nobody happens to call
-`extend_stream` — has no interaction to refresh its TTL with. If its
-storage entry is archived, the stream (and the ability to withdraw or
-cancel it) is lost even though funds remain committed to it.
-
-This is mitigated, not eliminated: every TTL bump (on create, withdraw,
-top-up, rate change, or an explicit `extend_stream` call) sizes itself to
-the stream's own remaining lifetime — `balance / rate`, converted to
-ledgers — when that is longer than the normal 90-day default, rather than
-always bumping by the flat default alone. A stream depositing enough to run
-for a year gets close to a year of TTL from that single interaction, not
-just 90 days. Two things this does not solve:
-
-- **It requires at least one interaction to take effect at all.** A stream
-  that has *never* been touched since `create_stream` (which does apply the
-  lifetime-aware bump) is already covered from the start; the residual risk
-  is a stream whose bump was capped below its full remaining lifetime (see
-  the next point) and that then goes untouched for longer than that capped
-  window.
-- **It cannot bump past the network's own maximum entry TTL** (`max_ttl`,
-  read at call time). A stream with a longer remaining lifetime than that
-  ceiling still needs an eventual `extend_stream` call before the ceiling
-  is reached, same as before this mitigation. `extend_stream` remains
-  permissionless specifically so anyone — the donor, the NGO, a keeper
-  bot, or a block explorer's own indexing pass — can perform that refresh
-  without needing any special authorization.
-
-### What is the cancelled-stream grace period?
-
-The admin can configure `cancel_grace_ledgers` so indexers have additional
-time to observe and process a cancellation. Cancelling a stream retains its
-record for the normal stream TTL plus that configured grace period; a value of
-zero keeps the default retention period.
-
-## Error codes
-
-Each contract exposes its failures as a `#[contracterror] enum Error`,
-returned as `Result<_, Error>` from every fallible entry point. Clients see
-the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
-
-### `donation-vault`
-
-| Code | Error                | Meaning                                                                 |
-| ---- | --------------------- | ------------------------------------------------------------------------ |
-| 1    | `AlreadyInitialized`  | `init` was already called; the vault already has an admin.               |
-| 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.          |
-| 3    | `StreamNotFound`      | No stream exists for the given stream id.                                |
-| 4    | `InvalidAmount`       | `deposit` or `rate` passed to `create_stream`, the `amount` passed to `top_up`, or the `new_rate` passed to `modify_rate` was zero or negative. |
-| 5    | `NothingToWithdraw`   | The stream has accrued nothing since its last checkpoint.                |
-| 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
-| 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
-| 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
-| 9    | `ArithmeticOverflow`  | A stream balance, withdrawn total, or stream ID would exceed its integer range. |
-| 10   | `DepositTooLow`       | `create_stream` was called with a deposit below the admin-configured minimum. |
-| 11   | `AlreadyPaused`       | `pause` was called when the vault was already paused. |
-| 12   | `AlreadyUnpaused`     | `unpause` was called when the vault was already active. |
-| 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
-| 14   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
-| 15   | `InvalidAdmin`        | `propose_admin` was called with the current admin instead of a different address. |
-
-### `ngo-registry`
-
-| Code | Error                | Meaning                                                          |
-| ---- | --------------------- | ------------------------------------------------------------------ |
-| 1    | `AlreadyInitialized`  | `init` was already called; the registry already has an admin.    |
-| 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.  |
-| 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
-| 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
-| 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
-| 6    | `InvalidName`         | `register` was called with a zero-length name.                   |
-| 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
-
-## Status
-
-Early development.
-
-## License
-
-Apache-2.0 — see [LICENSE](./LICENSE).
