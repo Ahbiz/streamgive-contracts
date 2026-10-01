@@ -6,9 +6,9 @@ going to `streamgive-docs` first.
 
 Soroban events have two parts:
 
-- **Topics** — a tuple, always starting with a `Symbol` naming the event.
+- **Topics** â€” a tuple, always starting with a `Symbol` naming the event.
   Topics are indexed/filterable.
-- **Data** — the event payload. Shown below as the Rust type(s) passed to
+- **Data** â€” the event payload. Shown below as the Rust type(s) passed to
   `env.events().publish((topics...), data)`. A single value publishes as
   itself; a tuple of values publishes as an XDR array in that order.
 
@@ -56,7 +56,7 @@ Emitted by `approve_ngo` when an admin marks a registered NGO as verified.
 
 Emitted by `revoke_ngo` when an admin reverses a prior approval, marking a
 verified NGO as unverified again. This is the direct counterpart to
-`approved` for the same `ngo_owner` — an indexer should treat a `revoked`
+`approved` for the same `ngo_owner` â€” an indexer should treat a `revoked`
 event as cancelling the most recent `approved` event for that address.
 
 | | |
@@ -138,19 +138,26 @@ much of it accrues to the NGO per second (see [`math::accrued`](../contracts/don
 ### `withdraw`
 
 Emitted by `withdraw` when an NGO claims everything accrued on a stream
-since the last checkpoint.
+since the last checkpoint, and once per contributing stream by
+`withdraw_batch`.
 
 | | |
 |---|---|
 | Topics | `("withdraw", stream_id: u64)` |
 | Data | `accrued: i128` |
 
-`accrued` is the gross amount released from the stream's balance — if a
+`accrued` is the gross amount released from the stream's balance â€” if a
 protocol fee is configured (see `set_fee_bps`/`set_treasury`), the NGO
 actually receives `accrued` minus the fee, with the fee paid to the
 treasury in the same transaction. No separate fee event is emitted; derive
 the split from the vault's `fee_bps()`/`treasury()` at the time of the
 transaction.
+
+A `withdraw_batch` call aggregates the gross accruals per token and makes a
+single transfer per token, but still emits one `withdraw` event per stream
+that had something to withdraw, so an indexer can track streams exactly as
+it would with individual `withdraw` calls. Streams that had accrued nothing
+are skipped and emit no event.
 
 The `withdraw` entry point **returns** that same net amount (gross minus
 fee), so a caller displaying the payout can use the return value directly;

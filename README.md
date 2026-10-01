@@ -9,7 +9,7 @@ donation flows end to end — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Contracts
 
 - `ngo-registry` — on-chain NGO application, verification, and registry
-- `donation-vault` — streaming donation vault (create / withdraw / cancel / modify streams)
+- `donation-vault` — streaming donation vault (create / withdraw / batch-withdraw / cancel / modify streams)
 
 ## Release profile
 
@@ -44,6 +44,12 @@ where it was and there is nothing to unwind when the pause is lifted.
 While the vault is paused, every entry point that moves tokens or changes
 a stream rejects the call with `Error::ContractPaused` (code 6) before
 touching storage or requiring any auth:
+
+Note that pausing does **not** stop time-based accrual. A stream's
+`pending_accrual` keeps growing while the vault is paused, so a stream
+paused for a week still owes a week of accrual once the pause is lifted.
+That accrual is claimable via `withdraw` as soon as the vault is
+unpaused.
 
 | Entry point     | While paused                                    |
 | --------------- | ----------------------------------------------- |
