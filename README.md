@@ -102,69 +102,17 @@ Notable coverage:
   (`invariants_hold_across_a_grid_of_inputs`) that checks, across a
   matrix of rates, balances, and elapsed durations, that accrual is
   always non-negative, never exceeds the remaining balance, and is
-  monotonically non-decreasing as elapsed time (or rate) grows — a
-  stand-in for property-based testing over the streaming math's edge
-  cases.
+  monotonically non-decreasing as elapsed time (or rate) grows.
+- A `proptest`-based `fuzz` module checks the same invariants (plus
+  monotonicity in balance and agreement with exact arithmetic) against
+  randomly generated `rate`/`elapsed`/`balance` inputs, biased towards
+  the zero and near-`MAX` edges.
 
 CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
 `cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
 build, a wasm binary size check (see
 [`scripts/check-wasm-size.sh`](scripts/check-wasm-size.sh)), and
 `cargo test --workspace` on every push and pull request.
-
-## Deploying
-
-[`scripts/deploy-testnet.sh`](scripts/deploy-testnet.sh) builds both
-contracts, deploys `ngo-registry` and `donation-vault` to Stellar
-testnet, initializes each one with an admin, and writes the resulting
-contract ids to [`deployments.json`](deployments.json).
-
-### Prerequisites
-
-- The [`stellar` CLI](https://developers.stellar.org/docs/tools/cli).
-- `rustup` with the `wasm32v1-none` target:
-  `rustup target add wasm32v1-none`.
-- A funded testnet identity, for example:
-  `stellar keys generate my-testnet-identity --network testnet --fund`.
-- Node.js (optional): only used to keep an existing `mainnet` entry in
-  `deployments.json` when the file is rewritten.
-
-The script checks for the CLI, `rustup`, and the wasm target up front and
-exits before deploying anything if one is missing.
-
-### Environment variables
-
-- `STELLAR_SOURCE_ACCOUNT` (required): the name of the funded Stellar CLI
-  identity that signs and pays for the deploy.
-- `STELLAR_ADMIN_ADDRESS` (optional): the `G...` address set as admin of
-  both contracts. Use a wallet a human can sign with, because admin
-  actions such as approving NGOs are driven from the browser admin panel,
-  which a CLI-only deployer key cannot do. `init` can only be called once
-  per contract. If unset, the admin falls back to the address of
-  `STELLAR_SOURCE_ACCOUNT`, which is fine for a throwaway deploy only.
-
-### Running the script
-
-From the repo root:
-
-```sh
-STELLAR_SOURCE_ACCOUNT=my-testnet-identity \
-STELLAR_ADMIN_ADDRESS=G... \
-./scripts/deploy-testnet.sh
-```
-
-### `deployments.json`
-
-`deployments.json` holds the live testnet deployment: the network, when it
-was deployed, the admin address, and the `ngo-registry` and
-`donation-vault` contract ids. The backend and frontend read these ids
-from their env files, so update them there after a redeploy. Running the
-script overwrites this file, so avoid committing a version rewritten by a
-personal test deploy.
-
-A mainnet deployment is recorded under the `mainnet` key of the same file
-by `scripts/deploy-mainnet.sh`, which also requires `STELLAR_ADMIN_ADDRESS`
-and `STELLAR_RPC_URL`.
 
 ## FAQ
 
