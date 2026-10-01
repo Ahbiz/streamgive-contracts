@@ -9,7 +9,8 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    String, Vec,
 };
 
 #[contracttype]
@@ -89,6 +90,27 @@ fn require_admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)?;
     admin.require_auth();
     Ok(admin)
+}
+
+fn approve_registered_ngo(env: &Env, ngo_owner: &Address) -> Result<(), Error> {
+    let key = DataKey::Ngo(ngo_owner.clone());
+    let mut ngo: Ngo = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotRegistered)?;
+    if ngo.verified {
+        return Err(Error::AlreadyVerified);
+    }
+    ngo.verified = true;
+    env.storage().persistent().set(&key, &ngo);
+    extend_instance_ttl(env);
+    extend_ngo_ttl(env, ngo_owner);
+
+    env.events()
+        .publish((symbol_short!("approved"), ngo_owner.clone()), ());
+
+    Ok(())
 }
 
 #[contract]
@@ -202,6 +224,30 @@ impl NgoRegistry {
         Ok(())
     }
 
+    /// Removes the caller's unverified NGO application.
+    ///
+    /// Verified registrations are intentionally permanent until an admin
+    /// revokes verification.
+    pub fn unregister(env: Env, owner: Address) -> Result<(), Error> {
+        owner.require_auth();
+
+        let key = DataKey::Ngo(owner.clone());
+        let ngo: Ngo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotRegistered)?;
+        if ngo.verified {
+            return Err(Error::AlreadyVerified);
+        }
+
+        env.storage().persistent().remove(&key);
+        extend_instance_ttl(&env);
+        env.events().publish((symbol_short!("unregist"), owner), ());
+
+        Ok(())
+    }
+
     /// Changes the name on an NGO's own pending application, so a typo or
     /// rename can be fixed without going through an admin. Requires the
     /// owner's auth. Fails with `Error::NotRegistered` for an address with
@@ -281,6 +327,16 @@ impl NgoRegistry {
             .ok_or(Error::NotRegistered)
     }
 
+    /// Returns whether an address is a registered, verified NGO.
+    /// Unknown and unverified addresses both return `false`.
+    pub fn is_verified(env: Env, owner: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, Ngo>(&DataKey::Ngo(owner))
+            .map(|ngo| ngo.verified)
+            .unwrap_or(false)
+    }
+
     /// Reads back the total number of registered NGOs.
     ///
     /// Lets callers (such as the impact page) display the total count
@@ -335,23 +391,19 @@ impl NgoRegistry {
     /// ```
     pub fn approve_ngo(env: Env, ngo_owner: Address) -> Result<(), Error> {
         require_admin(&env)?;
+        approve_registered_ngo(&env, &ngo_owner)
+    }
 
-        let key = DataKey::Ngo(ngo_owner.clone());
-        let mut ngo: Ngo = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotRegistered)?;
-        if ngo.verified {
-            return Err(Error::AlreadyVerified);
+    /// Marks each registered NGO as verified. Admin-only. Fails with
+    /// `Error::NotRegistered` or `Error::AlreadyVerified` if any owner
+    /// cannot be approved; a failed invocation leaves the entire batch
+    /// unchanged.
+    pub fn batch_approve(env: Env, owners: Vec<Address>) -> Result<(), Error> {
+        require_admin(&env)?;
+
+        for ngo_owner in owners.iter() {
+            approve_registered_ngo(&env, &ngo_owner)?;
         }
-        ngo.verified = true;
-        env.storage().persistent().set(&key, &ngo);
-        extend_instance_ttl(&env);
-        extend_ngo_ttl(&env, &ngo_owner);
-
-        env.events()
-            .publish((symbol_short!("approved"), ngo_owner), ());
 
         Ok(())
     }
@@ -431,6 +483,30 @@ impl NgoRegistry {
         }
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &owner);
+        Ok(())
+    }
+
+    /// Replaces the contract's Wasm bytecode in place. Admin-only.
+    /// Lets a bug fix be deployed without changing the contract address,
+    /// preserving every existing NGO entry and the admin key.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(NgoRegistry, ());
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+    /// client.upgrade(&new_wasm_hash);
+    /// ```
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
 }

@@ -50,6 +50,23 @@ fn register_ngo_stores_unverified_entry() {
 }
 
 #[test]
+fn unverified_ngo_can_unregister_and_register_again() {
+    let (env, client, _) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Pending NGO");
+
+    client.register(&owner, &name);
+    client.unregister(&owner);
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+
+    client.register(&owner, &String::from_str(&env, "Updated NGO"));
+    assert_eq!(
+        client.get_ngo(&owner).name,
+        String::from_str(&env, "Updated NGO")
+    );
+}
+
+#[test]
 fn double_register_fails() {
     let (env, client, _admin) = setup();
     let owner = Address::generate(&env);
@@ -127,6 +144,33 @@ fn get_unregistered_ngo_fails() {
 }
 
 #[test]
+fn is_verified_returns_false_for_registered_unverified_ngo() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    assert!(!client.is_verified(&owner));
+}
+
+#[test]
+fn is_verified_returns_true_for_verified_ngo() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+
+    assert!(client.is_verified(&owner));
+}
+
+#[test]
+fn is_verified_returns_false_for_unknown_address() {
+    let (env, client, _admin) = setup();
+    let random = Address::generate(&env);
+
+    assert!(!client.is_verified(&random));
+}
+
+#[test]
 fn approve_ngo_marks_verified() {
     let (env, client, _admin) = setup();
     let owner = Address::generate(&env);
@@ -160,6 +204,50 @@ fn approve_unregistered_ngo_fails() {
 
     let result = client.try_approve_ngo(&random);
     assert_eq!(result, Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn batch_approve_approves_each_ngo_and_publishes_events() {
+    let (env, client, _admin) = setup();
+    let first_owner = Address::generate(&env);
+    let second_owner = Address::generate(&env);
+    client.register(&first_owner, &String::from_str(&env, "First NGO"));
+    client.register(&second_owner, &String::from_str(&env, "Second NGO"));
+
+    client.batch_approve(&vec![&env, first_owner.clone(), second_owner.clone()]);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), first_owner.clone()).into_val(&env),
+                ().into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), second_owner.clone()).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+    assert!(client.get_ngo(&first_owner).verified);
+    assert!(client.get_ngo(&second_owner).verified);
+}
+
+#[test]
+fn batch_approve_fails_on_unregistered_ngo_without_partial_approval() {
+    let (env, client, _admin) = setup();
+    let registered_owner = Address::generate(&env);
+    let unregistered_owner = Address::generate(&env);
+    client.register(&registered_owner, &String::from_str(&env, "Registered NGO"));
+
+    let result =
+        client.try_batch_approve(&vec![&env, registered_owner.clone(), unregistered_owner]);
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+    assert!(!client.get_ngo(&registered_owner).verified);
 }
 
 #[test]
@@ -340,6 +428,48 @@ fn update_name_after_approval_fails() {
     let result = client.try_update_name(&owner, &String::from_str(&env, "Blue Cross"));
     assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
     assert_eq!(client.get_ngo(&owner).name, name);
+}
+
+#[test]
+fn update_name_after_revocation_succeeds() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Crsos"));
+    client.approve_ngo(&owner);
+
+    // The name an admin approved is locked only while the NGO stays
+    // verified, so the rename has to be rejected at this point.
+    let blocked = client.try_update_name(&owner, &String::from_str(&env, "Red Cross"));
+    assert_eq!(blocked, Err(Ok(Error::AlreadyVerified)));
+
+    client.revoke_ngo(&owner);
+    assert!(!client.get_ngo(&owner).verified);
+
+    let fixed = String::from_str(&env, "Red Cross");
+    client.update_name(&owner, &fixed);
+
+    // Events cover only the latest top-level call, so read them before
+    // `get_ngo` below replaces them.
+    assert_eq!(
+        env.events().all(),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("renamed"), owner.clone()).into_val(&env),
+                fixed.clone().into_val(&env),
+            ),
+        ]
+    );
+
+    assert_eq!(
+        client.get_ngo(&owner),
+        Ngo {
+            owner: owner.clone(),
+            name: fixed,
+            verified: false,
+        }
+    );
 }
 
 #[test]

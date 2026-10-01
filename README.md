@@ -3,10 +3,13 @@
 Soroban smart contracts powering StreamGive, a recurring/streaming donation
 platform for verified NGOs on Stellar.
 
+For how these contracts fit with the backend and frontend — and how a
+donation flows end to end — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Contracts
 
 - `ngo-registry` — on-chain NGO application, verification, and registry
-- `donation-vault` — streaming donation vault (create / withdraw / cancel / modify streams)
+- `donation-vault` — streaming donation vault (create / withdraw / batch-withdraw / cancel / modify streams)
 
 ## Release profile
 
@@ -41,6 +44,12 @@ where it was and there is nothing to unwind when the pause is lifted.
 While the vault is paused, every entry point that moves tokens or changes
 a stream rejects the call with `Error::ContractPaused` (code 6) before
 touching storage or requiring any auth:
+
+Note that pausing does **not** stop time-based accrual. A stream's
+`pending_accrual` keeps growing while the vault is paused, so a stream
+paused for a week still owes a week of accrual once the pause is lifted.
+That accrual is claimable via `withdraw` as soon as the vault is
+unpaused.
 
 | Entry point     | While paused                                    |
 | --------------- | ----------------------------------------------- |
@@ -93,9 +102,22 @@ Notable coverage:
   (`invariants_hold_across_a_grid_of_inputs`) that checks, across a
   matrix of rates, balances, and elapsed durations, that accrual is
   always non-negative, never exceeds the remaining balance, and is
-  monotonically non-decreasing as elapsed time (or rate) grows — a
-  stand-in for property-based testing over the streaming math's edge
-  cases.
+  monotonically non-decreasing as elapsed time (or rate) grows.
+- A `proptest`-based `fuzz` module checks the same invariants (plus
+  monotonicity in balance and agreement with exact arithmetic) against
+  randomly generated `rate`/`elapsed`/`balance` inputs, biased towards
+  the zero and near-`MAX` edges.
+
+To run the full local check before pushing (formatting, clippy, then
+tests, stopping on the first failure):
+
+```sh
+make check
+```
+
+This runs `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace`, matching what CI runs.
 
 CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
 `cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
