@@ -3,6 +3,9 @@
 Soroban smart contracts powering StreamGive, a recurring/streaming donation
 platform for verified NGOs on Stellar.
 
+For how these contracts fit with the backend and frontend — and how a
+donation flows end to end — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Contracts
 
 - `ngo-registry` — on-chain NGO application, verification, and registry
@@ -31,6 +34,43 @@ Change these with care: relaxing `opt-level`, `lto`, or `strip` grows the
 deployed wasm and raises fees, while turning `overflow-checks` off would
 let balance arithmetic wrap silently.
 
+## Pausing
+
+`donation-vault` has an admin-gated `pause` / `unpause` pair — an
+emergency brake for when something is wrong. `pause` only flips a flag in
+the instance storage: no funds are moved, so every balance stays exactly
+where it was and there is nothing to unwind when the pause is lifted.
+
+While the vault is paused, every entry point that moves tokens or changes
+a stream rejects the call with `Error::ContractPaused` (code 6) before
+touching storage or requiring any auth:
+
+Note that pausing does **not** stop time-based accrual. A stream's
+`pending_accrual` keeps growing while the vault is paused, so a stream
+paused for a week still owes a week of accrual once the pause is lifted.
+That accrual is claimable via `withdraw` as soon as the vault is
+unpaused.
+
+| Entry point     | While paused                                    |
+| --------------- | ----------------------------------------------- |
+| `create_stream` | Rejected                                        |
+| `withdraw`      | Rejected                                        |
+| `top_up`        | Rejected                                        |
+| `modify_rate`   | Rejected                                        |
+| `cancel_stream` | Still works — settles and refunds as usual      |
+
+`withdraw` being on that list is the point of the brake: it is the only
+path that pays tokens straight out of the vault, so a pause triggered by a
+suspected vulnerability has to close it or an attacker could simply drain
+funds while the rest of the contract is frozen.
+
+`cancel_stream` is deliberately left open. It is the one path that returns
+money to a donor, so keeping it available means a pause can never trap a
+donor's unspent deposit. The read-only views (`admin`, `pending_admin`,
+`get_stream`, `stream_count`, `pending_accrual`, `paused`, `treasury`,
+`fee_bps`) and `extend_stream` also keep working, since none of them can
+move funds, and `unpause` is of course still reachable.
+
 ## Related repositories
 
 - [streamgive-backend](https://github.com/streamgive/streamgive-backend) — indexer & API
@@ -43,69 +83,3 @@ Run the full test suite for all contracts from the workspace root:
 
 ```sh
 cargo test --workspace
-```
-
-To run tests for a single contract:
-
-```sh
-cargo test -p donation-vault
-cargo test -p ngo-registry
-```
-
-Notable coverage:
-
-- `donation-vault`'s `math` module unit-tests the streaming accrual
-  calculation (`accrued`) directly: zero/negative rate, zero balance,
-  zero elapsed time, capping at the remaining balance, and saturating
-  instead of overflowing/panicking near `i128::MAX`.
-- It also includes a deterministic grid-based invariant sweep
-  (`invariants_hold_across_a_grid_of_inputs`) that checks, across a
-  matrix of rates, balances, and elapsed durations, that accrual is
-  always non-negative, never exceeds the remaining balance, and is
-  monotonically non-decreasing as elapsed time (or rate) grows — a
-  stand-in for property-based testing over the streaming math's edge
-  cases.
-
-CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
-`cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
-build, a wasm binary size check (see
-[`scripts/check-wasm-size.sh`](scripts/check-wasm-size.sh)), and
-`cargo test --workspace` on every push and pull request.
-
-## Error codes
-
-Each contract exposes its failures as a `#[contracterror] enum Error`,
-returned as `Result<_, Error>` from every fallible entry point. Clients see
-the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
-
-### `donation-vault`
-
-| Code | Error                | Meaning                                                                 |
-| ---- | --------------------- | ------------------------------------------------------------------------ |
-| 1    | `AlreadyInitialized`  | `init` was already called; the vault already has an admin.               |
-| 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.          |
-| 3    | `StreamNotFound`      | No stream exists for the given stream id.                                |
-| 4    | `InvalidAmount`       | `deposit` or `rate` passed to `create_stream` was zero or negative.      |
-| 5    | `NothingToWithdraw`   | The stream has accrued nothing since its last checkpoint.                |
-| 6    | `ContractPaused`      | The admin has paused the vault; only `cancel_stream` still works.        |
-| 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
-| 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
-| 9    | `ArithmeticOverflow`  | A balance update or the stream-id counter would leave `i128`/`u64`'s range. |
-| 10   | `MixedNgo`            | `withdraw_batch` was given streams that don't all belong to the same NGO. |
-
-### `ngo-registry`
-
-| Code | Error                | Meaning                                                          |
-| ---- | --------------------- | ------------------------------------------------------------------ |
-| 1    | `AlreadyInitialized`  | `init` was already called; the registry already has an admin.    |
-| 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.  |
-| 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
-| 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
-
-## Status
-
-Early development.
-
-## License
-
-Apache-2.0 — see [LICENSE](./LICENSE).

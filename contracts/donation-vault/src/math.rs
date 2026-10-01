@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /// Computes how much of `balance` has unlocked given a constant per-second
 /// `rate` sustained over `elapsed` seconds, capped so it can never exceed
 /// what's actually left in the stream.
@@ -14,9 +15,35 @@ pub fn accrued(rate: i128, elapsed: u64, balance: i128) -> i128 {
     unlocked.min(balance)
 }
 
+/// Whole seconds a stream needs to pay out `balance` at a constant per-second
+/// `rate`, rounded up so a partial final second counts as a full one (the
+/// stream isn't empty until that last second has run).
+///
+/// Returns `None` for a non-positive `rate`, since a stream that never pays
+/// out never depletes, and for a result that doesn't fit in a `u64`. A
+/// non-positive `balance` is already depleted, so it takes 0 seconds.
+pub fn seconds_to_deplete(rate: i128, balance: i128) -> Option<u64> {
+    if rate <= 0 {
+        return None;
+    }
+    if balance <= 0 {
+        return Some(0);
+    }
+
+    // `balance / rate` plus one for any remainder — the same as
+    // `ceil(balance / rate)`, without the `balance + rate - 1` overflow.
+    let whole = balance / rate;
+    let seconds = if balance % rate == 0 {
+        whole
+    } else {
+        whole + 1
+    };
+    u64::try_from(seconds).ok()
+}
+
 #[cfg(test)]
 mod test {
-    use super::accrued;
+    use super::{accrued, seconds_to_deplete};
 
     #[test]
     fn zero_rate_accrues_nothing() {
@@ -117,6 +144,121 @@ mod test {
         }
     }
 
+    /// Randomised counterpart to the grid test above: the same invariants
+    /// (non-negative, capped, monotonic), but over inputs drawn from the whole
+    /// i128/u64 range, biased towards the zero and near-`MAX` edges the grid
+    /// only samples at a few fixed points.
+    mod fuzz {
+        use super::accrued;
+        use proptest::prelude::*;
+
+        fn any_rate() -> impl Strategy<Value = i128> {
+            prop_oneof![
+                any::<i128>(),
+                Just(0i128),
+                Just(i128::MAX),
+                0i128..=1_000,
+                (i128::MAX - 1_000)..=i128::MAX,
+                i128::MIN..=-1,
+            ]
+        }
+
+        fn any_balance() -> impl Strategy<Value = i128> {
+            any_rate()
+        }
+
+        fn any_elapsed() -> impl Strategy<Value = u64> {
+            prop_oneof![
+                any::<u64>(),
+                Just(0u64),
+                Just(u64::MAX),
+                0u64..=1_000,
+                (u64::MAX - 1_000)..=u64::MAX,
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+            /// Never negative, never more than what's left in the stream, and
+            /// never panics — for every input, including overflowing ones.
+            #[test]
+            fn non_negative_and_capped_by_balance(
+                rate in any_rate(),
+                elapsed in any_elapsed(),
+                balance in any_balance(),
+            ) {
+                let a = accrued(rate, elapsed, balance);
+                prop_assert!(a >= 0, "negative accrual: {a}");
+                prop_assert!(a <= balance.max(0), "accrual {a} exceeds balance {balance}");
+            }
+
+            /// More elapsed time never accrues less, even once capped.
+            #[test]
+            fn monotonic_in_elapsed(
+                rate in any_rate(),
+                e1 in any_elapsed(),
+                e2 in any_elapsed(),
+                balance in any_balance(),
+            ) {
+                let (lo, hi) = if e1 <= e2 { (e1, e2) } else { (e2, e1) };
+                prop_assert!(accrued(rate, lo, balance) <= accrued(rate, hi, balance));
+            }
+
+            /// A higher rate never accrues less for the same elapsed and balance.
+            #[test]
+            fn monotonic_in_rate(
+                r1 in any_rate(),
+                r2 in any_rate(),
+                elapsed in any_elapsed(),
+                balance in any_balance(),
+            ) {
+                let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+                prop_assert!(accrued(lo, elapsed, balance) <= accrued(hi, elapsed, balance));
+            }
+
+            /// A larger balance never lowers the accrual: the cap only loosens.
+            #[test]
+            fn monotonic_in_balance(
+                rate in any_rate(),
+                elapsed in any_elapsed(),
+                b1 in any_balance(),
+                b2 in any_balance(),
+            ) {
+                let (lo, hi) = if b1 <= b2 { (b1, b2) } else { (b2, b1) };
+                prop_assert!(accrued(rate, elapsed, lo) <= accrued(rate, elapsed, hi));
+            }
+
+            /// Non-positive rate or balance, or zero elapsed, accrues nothing.
+            #[test]
+            fn degenerate_inputs_accrue_nothing(
+                rate in any_rate(),
+                elapsed in any_elapsed(),
+                balance in any_balance(),
+            ) {
+                if rate <= 0 || balance <= 0 || elapsed == 0 {
+                    prop_assert_eq!(accrued(rate, elapsed, balance), 0);
+                }
+            }
+
+            /// Whenever `rate * elapsed` fits in i128, the result is exactly
+            /// `min(rate * elapsed, balance)`; when it doesn't, it saturates
+            /// to `balance`.
+            #[test]
+            fn matches_exact_arithmetic(
+                rate in 1i128..=i128::MAX,
+                elapsed in 1u64..=u64::MAX,
+                balance in 1i128..=i128::MAX,
+            ) {
+                let expected = match rate.checked_mul(elapsed as i128) {
+                    Some(unlocked) => unlocked.min(balance),
+                    None => balance,
+                };
+                prop_assert_eq!(accrued(rate, elapsed, balance), expected);
+            }
+        }
+    }
+
     #[test]
     fn monotonic_in_rate_for_fixed_elapsed_and_balance() {
         let rates = [0i128, 1, 5, 50, 500, i128::MAX];
@@ -129,5 +271,46 @@ mod test {
             assert!(a >= prev, "accrual decreased as rate grew: rate={rate}");
             prev = a;
         }
+    }
+
+    #[test]
+    fn never_depletes_at_a_non_positive_rate() {
+        assert_eq!(seconds_to_deplete(0, 1_000), None);
+        assert_eq!(seconds_to_deplete(-5, 1_000), None);
+        assert_eq!(seconds_to_deplete(0, 0), None);
+    }
+
+    #[test]
+    fn empty_balance_is_already_depleted() {
+        assert_eq!(seconds_to_deplete(10, 0), Some(0));
+        assert_eq!(seconds_to_deplete(10, -1), Some(0));
+    }
+
+    #[test]
+    fn exact_division_takes_exactly_balance_over_rate() {
+        assert_eq!(seconds_to_deplete(10, 1_000), Some(100));
+        assert_eq!(seconds_to_deplete(1, 1), Some(1));
+    }
+
+    #[test]
+    fn partial_final_second_rounds_up() {
+        // 1_000 / 300 = 3.33 — three seconds leave 100 unpaid, so a fourth
+        // is needed.
+        assert_eq!(seconds_to_deplete(300, 1_000), Some(4));
+        // One unit past an exact multiple still needs the extra second.
+        assert_eq!(seconds_to_deplete(10, 101), Some(11));
+        // And one unit short of the next multiple is still that many seconds.
+        assert_eq!(seconds_to_deplete(10, 99), Some(10));
+        // A balance below the rate finishes inside the first second.
+        assert_eq!(seconds_to_deplete(1_000, 1), Some(1));
+    }
+
+    #[test]
+    fn huge_values_neither_overflow_nor_panic() {
+        assert_eq!(seconds_to_deplete(1, i128::MAX), None);
+        assert_eq!(seconds_to_deplete(i128::MAX, i128::MAX), Some(1));
+        assert_eq!(seconds_to_deplete(i128::MAX, i128::MAX - 1), Some(1));
+        assert_eq!(seconds_to_deplete(2, i128::MAX), None);
+        assert_eq!(seconds_to_deplete(1, u64::MAX as i128), Some(u64::MAX));
     }
 }
