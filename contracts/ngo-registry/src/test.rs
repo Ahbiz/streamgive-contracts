@@ -3,6 +3,8 @@
 
 use super::*;
 use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
+use soroban_sdk::{xdr, IntoVal, Symbol, TryFromVal, Val};
 use soroban_sdk::testutils::{
     Address as _, AuthorizedFunction, Events as _, Ledger, MockAuth, MockAuthInvoke,
 };
@@ -385,6 +387,19 @@ fn update_name_changes_name_before_approval() {
     let fixed = String::from_str(&env, "Red Cross");
     client.update_name(&owner, &fixed);
 
+    // Checked straight after the call: `events().all()` only holds the last
+    // invocation's events, so the `get_ngo` read below would replace them.
+    // Compared as XDR because `Val` has no `PartialEq`.
+    let all = env.events().all();
+    let event = all.events().last().unwrap();
+    let xdr::ContractEventBody::V0(body) = &event.body;
+    let topics: Val = (symbol_short!("renamed"), owner.clone()).into_val(&env);
+    let data: Val = fixed.clone().into_val(&env);
+    assert_eq!(
+        xdr::ScVal::Vec(Some(xdr::ScVec(body.topics.clone()))),
+        xdr::ScVal::try_from_val(&env, &topics).unwrap()
+    );
+    assert_eq!(body.data, xdr::ScVal::try_from_val(&env, &data).unwrap());
     // Events cover only the latest top-level call, so read them before
     // `get_ngo` below replaces them.
     let events = env.events().all();

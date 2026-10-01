@@ -314,6 +314,10 @@ fn record_payout(stream: &mut Stream, amount: i128) -> Result<(), Error> {
     Ok(())
 }
 
+/// The protocol fee taken out of a `amount` payout: zero with no treasury
+/// set (there's nowhere to send it), otherwise `fee_bps` of `amount`
+/// rounded down and never more than `amount` itself.
+fn protocol_fee(env: &Env, amount: i128) -> i128 {
 /// Returns the protocol fee that would be taken on `amount`, using the same
 /// logic as `pay_ngo`. Zero when no treasury is configured, regardless of
 /// `fee_bps` — there's nowhere to send a fee without a destination address.
@@ -376,6 +380,9 @@ fn pay_ngo(
         return 0;
     }
 
+    let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+    let fee = protocol_fee(env, amount);
+    let fee = compute_fee(env, amount);
     let fee = compute_fee(env, token, amount);
     let net = amount - fee;
 
@@ -1534,6 +1541,14 @@ impl DonationVault {
             if !ngo_entry.verified {
                 return Err(Error::NgoNotVerified);
             }
+        }
+
+        // The most the NGO can draw in the first second is `rate`, capped by
+        // the deposit. If the fee would swallow all of it, the stream could
+        // never pay the NGO anything, so refuse it up front.
+        let first_payout = rate.min(deposit);
+        if first_payout - protocol_fee(&env, first_payout) <= 0 {
+            return Err(Error::InvalidAmount);
         }
 
         let token_client = token::Client::new(&env, &token);
