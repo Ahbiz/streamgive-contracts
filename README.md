@@ -45,6 +45,12 @@ While the vault is paused, every entry point that moves tokens or changes
 a stream rejects the call with `Error::ContractPaused` (code 6) before
 touching storage or requiring any auth:
 
+Note that pausing does **not** stop time-based accrual. A stream's
+`pending_accrual` keeps growing while the vault is paused, so a stream
+paused for a week still owes a week of accrual once the pause is lifted.
+That accrual is claimable via `withdraw` as soon as the vault is
+unpaused.
+
 | Entry point     | While paused                                    |
 | --------------- | ----------------------------------------------- |
 | `create_stream` | Rejected                                        |
@@ -96,9 +102,22 @@ Notable coverage:
   (`invariants_hold_across_a_grid_of_inputs`) that checks, across a
   matrix of rates, balances, and elapsed durations, that accrual is
   always non-negative, never exceeds the remaining balance, and is
-  monotonically non-decreasing as elapsed time (or rate) grows — a
-  stand-in for property-based testing over the streaming math's edge
-  cases.
+  monotonically non-decreasing as elapsed time (or rate) grows.
+- A `proptest`-based `fuzz` module checks the same invariants (plus
+  monotonicity in balance and agreement with exact arithmetic) against
+  randomly generated `rate`/`elapsed`/`balance` inputs, biased towards
+  the zero and near-`MAX` edges.
+
+To run the full local check before pushing (formatting, clippy, then
+tests, stopping on the first failure):
+
+```sh
+make check
+```
+
+This runs `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace`, matching what CI runs.
 
 CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
 `cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
@@ -160,8 +179,8 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
 | 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
-| 9    | `ArithmeticOverflow`  | A stream balance, withdrawn total, or stream ID would exceed its integer range. |
-| 10   | `DepositTooLow`       | `create_stream` was called with a deposit below the admin-configured minimum. |
+| 9    | `ArithmeticOverflow`  | A balance, payout, or stream-id calculation exceeded its supported range. |
+| 10   | `DepositTooLow`       | `create_stream` received a deposit below the configured minimum. |
 | 11   | `AlreadyPaused`       | `pause` was called when the vault was already paused. |
 | 12   | `AlreadyUnpaused`     | `unpause` was called when the vault was already active. |
 | 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
@@ -182,6 +201,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
 | 6    | `NameTooLong`         | `register` or `update_name` was called with a `name` longer than `MAX_NGO_NAME_LEN` (200 bytes). |
 | 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
+| 8    | `ArithmeticOverflow`  | The total NGO counter could not be incremented without exceeding its range. |
 
 ## Status
 
