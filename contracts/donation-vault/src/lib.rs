@@ -94,6 +94,10 @@ pub struct Config {
 pub enum DataKey {
     Admin,
     PendingAdmin,
+    /// Set by `renounce_admin`. Distinguishes a vault whose admin permanently
+    /// stepped down from one that was never initialized, and blocks `init`
+    /// from installing a new admin afterwards.
+    AdminRenounced,
     NextStreamId,
     Stream(u64),
     Paused,
@@ -143,7 +147,9 @@ pub enum Error {
     ArithmeticOverflow = 9,
     /// `deposit` was below the configured `min_deposit`.
     DepositTooLow = 10,
+    /// `pause` was called while the vault was already paused.
     AlreadyPaused = 11,
+    /// `unpause` was called while the vault was not paused.
     AlreadyUnpaused = 12,
     SelfStream = 13,
     StreamCancelled = 14,
@@ -161,32 +167,23 @@ pub enum Error {
     /// silently treated as `0` — that could collide with an existing
     /// stream. Returned instead of defaulting.
     StreamCounterMissing = 18,
-    /// The admin has renounced control, so admin-gated calls are permanently
-    /// disabled.
-    AdminRenounced = 16,
-    /// `create_stream` would push the donor's open-stream count past the
-    /// configured `max_streams_per_donor` cap (issue #94). Checked before
-    /// any funds move, so a rejected donor is rejected without a transfer.
-    StreamLimitExceeded = 16,
-    /// A registry is configured, but the NGO either isn't registered there
-    /// or isn't yet approved by the registry's admin. `create_stream`
-    /// refuses to open a stream for an NGO the registry hasn't verified.
-    NgoNotVerified = 17,
-    /// `NextStreamId` was missing from instance storage at `create_stream`
-    /// time. This should only happen if the contract was never `init`ed -
-    /// returned instead of silently treating the counter as `0`, which
-    /// could collide with an existing stream.
-    StreamCounterMissing = 18,
     /// `set_fee_bps` was called with a non-zero fee while no treasury is
     /// configured. Without this, the fee would be silently dropped by
     /// `compute_fee` (which returns 0 whenever no treasury is set,
     /// regardless of `fee_bps`) - the admin would believe revenue is
     /// accruing when it isn't, with no error or event to say otherwise.
     FeeRequiresTreasury = 19,
+    /// `rescue_stream` was called while the vault is not paused. It only
+    /// exists for incident response, not as an ordinary way to close a
+    /// stream out.
+    NotPaused = 20,
+    /// Every stream in a batch withdrawal must target the same NGO.
+    MixedNgo = 21,
+    /// The admin has renounced control, so admin-gated calls are permanently
+    /// disabled.
+    AdminRenounced = 22,
 }
 
-/// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
-/// an unreasonable cut of donations.
 const MAX_FEE_BPS: u32 = 1_000;
 
 /// Default per-donor stream cap applied when `set_max_streams_per_donor`
@@ -275,7 +272,17 @@ fn extend_cancelled_stream_ttl(env: &Env, stream_id: u64, grace_ledgers: u32) ->
 /// `Error::NotInitialized` if `init` hasn't been called yet. Shared by
 /// every admin-gated entry point so the same three steps aren't repeated
 /// at each call site.
+fn admin_renounced(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::AdminRenounced)
+        .unwrap_or(false)
+}
+
 fn require_admin(env: &Env) -> Result<Address, Error> {
+    if admin_renounced(env) {
+        return Err(Error::AdminRenounced);
+    }
     let admin: Address = env
         .storage()
         .instance()
@@ -314,10 +321,6 @@ fn record_payout(stream: &mut Stream, amount: i128) -> Result<(), Error> {
     Ok(())
 }
 
-/// The protocol fee taken out of a `amount` payout: zero with no treasury
-/// set (there's nowhere to send it), otherwise `fee_bps` of `amount`
-/// rounded down and never more than `amount` itself.
-fn protocol_fee(env: &Env, amount: i128) -> i128 {
 /// Returns the protocol fee that would be taken on `amount`, using the same
 /// logic as `pay_ngo`. Zero when no treasury is configured, regardless of
 /// `fee_bps` — there's nowhere to send a fee without a destination address.
@@ -333,15 +336,11 @@ fn protocol_fee(env: &Env, amount: i128) -> i128 {
 /// is bounded by `amount / 10_000`, and `remainder * fee_bps` is bounded by
 /// `9_999 * 1_000`, both comfortably inside i128. The result is the exact
 /// `floor(amount * fee_bps / 10_000)`, not an approximation of it.
-fn compute_fee(env: &Env, amount: i128) -> i128 {
+fn compute_fee(env: &Env, token: &Address, amount: i128) -> i128 {
     let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
     match treasury {
         Some(_) => {
-            let fee_bps = env
-                .storage()
-                .instance()
-                .get::<_, u32>(&DataKey::FeeBps)
-                .unwrap_or(0) as i128;
+            let fee_bps = effective_fee_bps(env, token) as i128;
             let quotient = amount / 10_000;
             let remainder = amount % 10_000;
             (quotient * fee_bps + (remainder * fee_bps) / 10_000).min(amount)
@@ -369,30 +368,21 @@ fn effective_fee_bps(env: &Env, token: &Address) -> u32 {
 /// single place the fee split is computed, so callers that report the
 /// payout to their own callers (`withdraw`) can return exactly what the
 /// NGO received rather than recomputing the fee and risking drift.
-fn pay_ngo(
-    env: &Env,
-    token_client: &token::Client,
-    token: &Address,
-    ngo: &Address,
-    amount: i128,
-) -> i128 {
+fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128) -> i128 {
     if amount <= 0 {
         return 0;
     }
 
     let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
-    let fee = protocol_fee(env, amount);
-    let fee = compute_fee(env, amount);
-    let fee = compute_fee(env, token, amount);
+    let fee = compute_fee(env, &token_client.address, amount);
     let net = amount - fee;
 
     if net > 0 {
         token_client.transfer(&env.current_contract_address(), ngo, &net);
     }
     if fee > 0 {
-        let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
-        if let Some(treasury) = treasury {
-            token_client.transfer(&env.current_contract_address(), &treasury, &fee);
+        if let Some(treasury_address) = treasury {
+            token_client.transfer(&env.current_contract_address(), &treasury_address, &fee);
         }
     }
 
@@ -416,7 +406,6 @@ fn settle(stream: &mut Stream, now: u64) -> Result<i128, Error> {
     let accrued = math::accrued(stream.rate, elapsed, stream.balance);
 
     if accrued > 0 {
-        pay_ngo(env, &token_client, &stream.token, &stream.ngo, accrued);
         record_payout(stream, accrued)?;
     }
     stream.last_update = now;
@@ -445,6 +434,9 @@ impl DonationVault {
     /// client.init(&admin);
     /// ```
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+        if admin_renounced(&env) {
+            return Err(Error::AdminRenounced);
+        }
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -474,6 +466,9 @@ impl DonationVault {
     /// assert_eq!(client.admin(), admin);
     /// ```
     pub fn admin(env: Env) -> Result<Address, Error> {
+        if admin_renounced(&env) {
+            return Err(Error::AdminRenounced);
+        }
         env.storage()
             .instance()
             .get(&DataKey::Admin)
@@ -1092,9 +1087,6 @@ impl DonationVault {
         require_admin(&env)?;
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         extend_instance_ttl(&env);
-
-        env.events().publish((symbol_short!("treasury"),), treasury);
-
         Ok(())
     }
 
@@ -1217,6 +1209,8 @@ impl DonationVault {
     /// ceiling without maintaining a separate off-chain copy.
     pub fn max_fee_bps(_env: Env) -> u32 {
         MAX_FEE_BPS
+    }
+
     /// Sets a per-token protocol fee override, in basis points (issue
     /// #200). `pay_ngo` uses this instead of the global `fee_bps` for any
     /// payout in `token`, falling back to the global default for every
@@ -1547,7 +1541,7 @@ impl DonationVault {
         // the deposit. If the fee would swallow all of it, the stream could
         // never pay the NGO anything, so refuse it up front.
         let first_payout = rate.min(deposit);
-        if first_payout - protocol_fee(&env, first_payout) <= 0 {
+        if first_payout - compute_fee(&env, &token, first_payout) <= 0 {
             return Err(Error::InvalidAmount);
         }
 
@@ -1686,7 +1680,7 @@ impl DonationVault {
         extend_stream_ttl(&env, stream_id, stream.rate, stream.balance);
 
         let token_client = token::Client::new(&env, &stream.token);
-        let net = pay_ngo(&env, &token_client, &stream.token, &stream.ngo, accrued);
+        let net = pay_ngo(&env, &token_client, &stream.ngo, accrued);
 
         env.events()
             .publish((symbol_short!("withdraw"), stream_id), accrued);
@@ -1797,7 +1791,7 @@ impl DonationVault {
             // than one per stream.
             for (token, gross) in payouts.iter() {
                 let token_client = token::Client::new(&env, &token);
-                pay_ngo(&env, &token_client, &token, &ngo, gross);
+                pay_ngo(&env, &token_client, &ngo, gross);
             }
         }
 

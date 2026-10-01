@@ -46,6 +46,8 @@ This project does not yet follow a formal versioning scheme — each contract's
   / `cancel_admin_proposal`, matching `donation-vault`'s pattern.
 - Contract events for registry and vault state changes (see
   [`docs/EVENTS.md`](docs/EVENTS.md)).
+- Document storage TTL policy, inactivity expiry risks, and keep-alive entry
+  points (`extend_stream` and `touch_ngo`) in `README.md` and `docs/STORAGE.md`.
 - `scripts/deploy-testnet.sh` for deploying both contracts to testnet.
 - `scripts/deploy-mainnet.sh` for deploying to mainnet. It requires
   `--confirm`, pins the Public network passphrase, requires an explicit

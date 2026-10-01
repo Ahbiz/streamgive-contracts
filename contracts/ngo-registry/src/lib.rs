@@ -52,7 +52,7 @@ pub enum Error {
     NoPendingAdmin = 8,
     /// The proposed administrator is not a valid replacement.
     InvalidAdmin = 9,
-    ArithmeticOverflow = 8,
+    ArithmeticOverflow = 10,
 }
 
 /// Upper bound on `Ngo.name`, in bytes. Persistent storage cost scales with
@@ -377,6 +377,8 @@ impl NgoRegistry {
             .instance()
             .get(&DataKey::TotalNgos)
             .unwrap_or(0)
+    }
+
     /// Removes the caller's unverified NGO application.
     ///
     /// Verified registrations are intentionally permanent until an admin
