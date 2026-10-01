@@ -67,9 +67,9 @@ funds while the rest of the contract is frozen.
 `cancel_stream` is deliberately left open. It is the one path that returns
 money to a donor, so keeping it available means a pause can never trap a
 donor's unspent deposit. The read-only views (`admin`, `pending_admin`,
-`get_stream`, `stream_count`, `pending_accrual`, `paused`, `treasury`,
-`fee_bps`) and `extend_stream` also keep working, since none of them can
-move funds, and `unpause` is of course still reachable.
+`get_stream`, `stream_count`, `streams_by_donor`, `pending_accrual`, `paused`,
+`treasury`, `fee_bps`) and `extend_stream` also keep working, since none of
+them can move funds, and `unpause` is of course still reachable.
 
 ## Related repositories
 
@@ -204,6 +204,8 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
 | 6    | `NameTooLong`         | `register` or `update_name` was called with a `name` longer than `MAX_NGO_NAME_LEN` (200 bytes). |
 | 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
+| 8    | `NoPendingAdmin`      | `accept_admin` or `cancel_admin_proposal` was called without a prior (or already-completed) `propose_admin`. |
+| 9    | `InvalidAdmin`        | `propose_admin` was called with the current admin instead of a different address. |
 | 8    | `ArithmeticOverflow`  | The total NGO counter could not be incremented without exceeding its range. |
 
 ## Status
