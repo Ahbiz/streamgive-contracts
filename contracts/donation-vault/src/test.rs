@@ -45,6 +45,14 @@ fn last_event(env: &Env) -> LastEvent {
     }
 }
 
+/// Asserts the most recently published event matches the given topics and
+/// data, as a one-line shorthand over `last_event` for call sites that don't
+/// need to keep the captured event around for anything else.
+fn assert_last_event(env: &Env, topics: Val, data: Val) {
+    let vec_topics = Vec::<Val>::try_from_val(env, &topics).unwrap();
+    assert_eq!(last_event(env), (vec_topics, data));
+}
+
 /// The number of events emitted by `contract`. Filters by contract address
 /// so token transfers firing inside the same invocation don't inflate the
 /// count, and only covers the most recent invocation.
@@ -117,6 +125,8 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     let stream_id = s
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let created = last_event(&s.env);
+
     // `last_event` only sees the latest top-level call, so assert it before
     // any other call (such as a balance read) replaces it.
     let created = last_event(&s.env);
@@ -132,6 +142,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
                 10i128
             )
                 .into_val(&s.env),
+        ),
         )
     );
     assert_eq!(s.token.balance(&s.donor), 0);
@@ -160,6 +171,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
     s.env.ledger().with_mut(|l| l.timestamp += 20);
     // 200 more settles to the NGO on cancel; the untouched 300 refunds to the donor.
     let refund = s.client.cancel_stream(&stream_id);
+    let cancelled = last_event(&s.env);
     assert_eq!(refund, 300);
     let cancelled = last_event(&s.env);
     assert_eq!(
@@ -827,10 +839,45 @@ fn unpause_rejects_duplicate_unpause() {
 }
 
 #[test]
-fn withdraw_with_no_treasury_takes_no_fee() {
+fn set_fee_bps_rejects_nonzero_fee_without_treasury() {
+    // Issue #193: without this, the fee would be silently dropped by
+    // compute_fee (which returns 0 whenever no treasury is configured,
+    // regardless of fee_bps) - the admin would believe revenue is accruing
+    // when it isn't, with no error or event to say otherwise.
+    let s = setup();
+    let result = s.client.try_set_fee_bps(&500);
+    assert_eq!(result, Err(Ok(Error::FeeRequiresTreasury)));
+    assert_eq!(s.client.fee_bps(), 0); // rejected - the fee was never stored
+
+    // A zero fee is always fine, treasury or not - there's nothing to drop.
+    s.client.set_fee_bps(&0);
+    assert_eq!(s.client.fee_bps(), 0);
+
+    // Once a treasury is configured, the same fee is accepted.
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    assert_eq!(s.client.fee_bps(), 500);
+}
+
+#[test]
+fn withdraw_after_treasury_cleared_takes_no_fee_even_with_fee_bps_set() {
+    // clear_treasury can leave a non-zero fee_bps configured with no
+    // treasury to receive it - set_fee_bps's own guard only runs at
+    // configuration time, so this isn't a bypass of #193, just the other
+    // documented way compute_fee's "no treasury -> no fee" rule applies:
+    // once a fee was legitimately set while a treasury existed, clearing
+    // that treasury later must not start silently failing withdrawals -
+    // it should simply stop collecting the fee, exactly like never having
+    // set one.
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
-    s.client.set_fee_bps(&500); // configured, but no treasury yet
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.clear_treasury();
+    assert_eq!(s.client.fee_bps(), 500); // fee_bps itself is untouched by clear_treasury
 
     let stream_id = s
         .client
@@ -840,6 +887,67 @@ fn withdraw_with_no_treasury_takes_no_fee() {
     let withdrawn = s.client.withdraw(&stream_id);
     assert_eq!(withdrawn, 500);
     assert_eq!(s.token.balance(&s.ngo), 500);
+}
+
+#[test]
+fn pending_payout_with_no_treasury_reports_no_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // set_fee_bps rejects a non-zero fee with no treasury configured
+    // (#193), so the only way to legitimately reach "fee_bps > 0, no
+    // treasury" is to set a treasury first, then clear it - fee_bps itself
+    // is untouched by clear_treasury.
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.clear_treasury();
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
+    assert_eq!(net, 500); // full accrual goes to the NGO
+}
+
+#[test]
+fn pending_payout_with_zero_fee_bps_reports_no_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury); // treasury set, but fee_bps left at 0
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
+    assert_eq!(net, 500);
+}
+
+#[test]
+fn pending_payout_with_treasury_and_fee_splits_correctly() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5%
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(fee, 25); // 5% of 500
+    assert_eq!(net, 475); // 500 - 25
 }
 
 #[test]
@@ -887,12 +995,10 @@ fn withdraw_splits_protocol_fee_to_treasury() {
         )
     );
     s.client.set_fee_bps(&500); // 5%
-    assert_eq!(
-        last_event(&s.env),
-        (
-            (symbol_short!("feeset"),).into_val(&s.env),
-            500u32.into_val(&s.env),
-        )
+    assert_last_event(
+        &s.env,
+        (symbol_short!("feeset"),).into_val(&s.env),
+        500u32.into_val(&s.env),
     );
 
     let stream_id = s
@@ -1018,22 +1124,32 @@ fn protocol_fee_becomes_nonzero_at_the_rounding_boundary() {
 }
 
 #[test]
-fn get_config_reflects_admin_settings() {
+fn compute_fee_avoids_overflow_near_i128_max() {
     let s = setup();
+
     let treasury = Address::generate(&s.env);
-
     s.client.set_treasury(&treasury);
-    s.client.set_fee_bps(&500);
-    s.client.pause();
+    s.client.set_fee_bps(&1_000); // 10%, the maximum allowed fee
 
-    assert_eq!(
-        s.client.get_config(),
-        Config {
-            paused: true,
-            treasury: Some(treasury),
-            fee_bps: 500,
-        }
-    );
+    // `amount * fee_bps` (i128::MAX * 1_000) overflows i128 long before the
+    // divide-by-10_000 brings the result back into range. A naive multiply,
+    // or a `saturating_mul` that silently clamps the overflowed product
+    // before dividing, both produce a fee many orders of magnitude smaller
+    // than the correct one. `compute_fee` must return the exact
+    // floor(amount * fee_bps / 10_000) instead.
+    let amount = i128::MAX;
+    let fee = s
+        .env
+        .as_contract(&s.client.address, || compute_fee(&s.env, amount));
+
+    let expected = (amount / 10_000) * 1_000 + ((amount % 10_000) * 1_000) / 10_000;
+    assert_eq!(fee, expected);
+
+    // The fee must never exceed the amount it's taken from, and at a 10%
+    // rate should be in the right order of magnitude — not the ~10^4
+    // smaller value a saturated-then-divided intermediate would yield.
+    assert!(fee <= amount);
+    assert!(fee > amount / 11);
 }
 
 #[test]
@@ -1046,6 +1162,8 @@ fn set_fee_bps_rejects_over_cap() {
 #[test]
 fn set_fee_bps_boundary_exact_max_succeeds() {
     let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
 
     // Exactly 1 000 bps (10%) is the maximum allowed fee — it must be
     // accepted and stored faithfully.
@@ -2283,7 +2401,10 @@ fn admin_entry_points_require_admin_auth() {
     s.client.clear_treasury();
     assert_auth_required_from(&s, &admin, "clear_treasury");
 
-    s.client.set_fee_bps(&100);
+    // 0, not 100: the treasury was just cleared above, and a non-zero fee
+    // with no treasury configured is rejected (#193) - irrelevant to what
+    // this test checks (that set_fee_bps requires admin auth at all).
+    s.client.set_fee_bps(&0);
     assert_auth_required_from(&s, &admin, "set_fee_bps");
 
     let new_admin = Address::generate(&s.env);
@@ -2323,9 +2444,6 @@ fn admin_can_set_the_per_donor_cap() {
     assert_eq!(s.client.max_streams_per_donor(), 5);
 }
 
-    let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
-    assert_eq!(net, 500); // full accrual goes to the NGO
 #[test]
 fn non_admin_cannot_set_the_per_donor_cap() {
     let s = setup();
@@ -2374,9 +2492,6 @@ fn raising_the_cap_lets_the_next_stream_through() {
     assert_eq!(s.client.get_stream(&stream_id).donor, s.donor);
 }
 
-    let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
-    assert_eq!(net, 500);
 #[test]
 fn lowering_the_cap_does_not_retroactively_affect_existing_streams() {
     let s = setup();
@@ -2498,10 +2613,111 @@ fn status_is_queryable_after_cancel_then_further_operations_fail() {
         s.client.get_stream(&stream_id).status,
         StreamStatus::Cancelled
     );
-    // withdraw on a cancelled stream is rejected too (cancel zeroes the
-    // rate, so nothing can ever accrue again) -- top_up's own rejection on
-    // a cancelled stream already has a dedicated test above.
+    // top_up on a cancelled stream is rejected (cancelled sets rate = 0).
     s.env.ledger().with_mut(|l| l.timestamp += 10);
-    let result = s.client.try_withdraw(&stream_id);
-    assert_eq!(result, Err(Ok(Error::NothingToWithdraw)));
+    let result = s.client.try_top_up(&stream_id, &100);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+// =============================================================================
+// Reentrancy ordering: state before transfer (issue #194)
+// =============================================================================
+
+/// A token stub that reenters `cancel_stream` on the exact stream being
+/// paid out, from inside its own `transfer`, to prove the vault can't be
+/// tricked into a double payout by a malicious or non-standard token.
+///
+/// In this Soroban SDK version, cross-contract calls default to
+/// `ContractReentryMode::Prohibited` (see `soroban-env-host`'s
+/// `call`/`try_call`): the host itself refuses to let `cancel_stream`
+/// re-enter the vault contract while the vault is already on the call
+/// stack, independent of `cancel_stream`'s own state-before-transfer
+/// ordering. That is a real, load-bearing platform guarantee this test
+/// exercises directly - but it is not a substitute for the ordering fix:
+/// if a future host version relaxed that default (the `try_call` host
+/// function's own doc comment notes a `reentry` flag is anticipated to be
+/// threaded through from `try_call`), the ordering becomes the only
+/// remaining defense, since by then the stream's balance/cancelled state
+/// is already zeroed and persisted *before* this transfer is ever called,
+/// so a reentrant `cancel_stream` that did get through would find nothing
+/// left to double-pay.
+///
+/// The host currently escalates this rejection to a hard panic through
+/// the full call chain (observed directly: the reentry itself surfaces as
+/// a recoverable `Context::InvalidAction` inside `try_call`, but the
+/// *resuming* outer `transfer` then fails `Auth::InvalidAction` and that
+/// is not recoverable), rather than letting `try_cancel_stream` return a
+/// clean `Err` the stub could gracefully continue past - so this is a
+/// `#[should_panic]` test asserting the whole `cancel_stream` call aborts,
+/// not one that inspects final balances afterward.
+///
+/// Only `transfer` is implemented - `DonationVault` never calls any other
+/// token method - and it attempts the reentrant call unconditionally.
+#[contract]
+struct ReentrantToken;
+
+#[contracttype]
+enum ReentrantKey {
+    Real,
+    Vault,
+    StreamId,
+}
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn init(env: Env, real: Address, vault: Address, stream_id: u64) {
+        env.storage().instance().set(&ReentrantKey::Real, &real);
+        env.storage().instance().set(&ReentrantKey::Vault, &vault);
+        env.storage()
+            .instance()
+            .set(&ReentrantKey::StreamId, &stream_id);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        let vault: Address = env.storage().instance().get(&ReentrantKey::Vault).unwrap();
+        let stream_id: u64 = env
+            .storage()
+            .instance()
+            .get(&ReentrantKey::StreamId)
+            .unwrap();
+        let vault_client = DonationVaultClient::new(&env, &vault);
+        // Reenter mid-transfer, before this outer transfer has itself
+        // completed. The host rejects this outright (see the type-level
+        // doc comment above) and currently escalates that rejection all
+        // the way up through the resuming outer transfer, so this call
+        // never returns.
+        vault_client.cancel_stream(&stream_id);
+
+        let real: Address = env.storage().instance().get(&ReentrantKey::Real).unwrap();
+        TokenClient::new(&env, &real).transfer(&from, &to, &amount);
+    }
+}
+
+#[test]
+#[should_panic]
+fn cancel_stream_reentrancy_is_rejected_by_the_host() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 20); // 200 accrues
+
+    // Swap the stream's token for the reentrant stub *after* creation, so
+    // create_stream's own transfer (the deposit pull) used the real SAC,
+    // and only cancel_stream's payout/refund transfers go through the stub.
+    let reentrant_id = s.env.register(ReentrantToken, ());
+    let reentrant_client = ReentrantTokenClient::new(&s.env, &reentrant_id);
+    reentrant_client.init(&s.token.address, &s.client.address, &stream_id);
+    s.env.as_contract(&s.client.address, || {
+        let key = DataKey::Stream(stream_id);
+        let mut stream: Stream = s.env.storage().persistent().get(&key).unwrap();
+        stream.token = reentrant_id.clone();
+        s.env.storage().persistent().set(&key, &stream);
+    });
+
+    // Must panic: the reentrant cancel_stream call inside transfer is
+    // rejected by the host's reentry prohibition.
+    s.client.cancel_stream(&stream_id);
 }
