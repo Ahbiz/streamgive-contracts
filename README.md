@@ -8,7 +8,7 @@ donation flows end to end — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Contracts
 
-- `ngo-registry` — on-chain NGO application, verification, and registry
+- `ngo-registry` — on-chain NGO application, verification, and registry. `register` and `update_name` cap `name` at 200 bytes (`Error::NameTooLong` otherwise), matching the backend's own 200-char limit.
 - `donation-vault` — streaming donation vault (create / withdraw / cancel / modify streams)
 
 ## Release profile
@@ -167,6 +167,9 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
 | 14   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
 | 15   | `InvalidAdmin`        | `propose_admin` was called with the current admin instead of a different address. |
+| 16   | `StreamLimitExceeded` | `create_stream` would push the donor's open-stream count past `max_streams_per_donor`. |
+| 17   | `NgoNotVerified`      | A registry is configured and the NGO isn't registered there or isn't approved yet. |
+| 18   | `StreamCounterMissing`| The stream-id counter was missing from storage at `create_stream` time (the contract was never `init`ed). |
 
 ### `ngo-registry`
 
@@ -177,7 +180,7 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
 | 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
 | 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
-| 6    | `InvalidName`         | `register` was called with a zero-length name.                   |
+| 6    | `NameTooLong`         | `register` or `update_name` was called with a `name` longer than `MAX_NGO_NAME_LEN` (200 bytes). |
 | 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
 
 ## Status

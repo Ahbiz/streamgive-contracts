@@ -112,6 +112,25 @@ pub enum Error {
     StreamCancelled = 14,
     /// The proposed administrator is not a valid replacement.
     InvalidAdmin = 15,
+    /// `create_stream` would push the donor's open-stream count past the
+    /// configured `max_streams_per_donor` cap (issue #94). Checked before
+    /// any funds move, so a rejected donor is rejected without a transfer.
+    StreamLimitExceeded = 16,
+    /// A registry is configured, but the NGO either isn't registered there
+    /// or isn't yet approved by the registry's admin. `create_stream`
+    /// refuses to open a stream for an NGO the registry hasn't verified.
+    NgoNotVerified = 17,
+    /// `NextStreamId` was missing from instance storage at `create_stream`
+    /// time. This should only happen if the contract was never `init`ed -
+    /// returned instead of silently treating the counter as `0`, which
+    /// could collide with an existing stream.
+    StreamCounterMissing = 18,
+    /// `set_fee_bps` was called with a non-zero fee while no treasury is
+    /// configured. Without this, the fee would be silently dropped by
+    /// `compute_fee` (which returns 0 whenever no treasury is set,
+    /// regardless of `fee_bps`) - the admin would believe revenue is
+    /// accruing when it isn't, with no error or event to say otherwise.
+    FeeRequiresTreasury = 19,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -215,12 +234,29 @@ fn record_payout(stream: &mut Stream, amount: i128) -> Result<(), Error> {
 /// logic as `pay_ngo`. Zero when no treasury is configured, regardless of
 /// `fee_bps` — there's nowhere to send a fee without a destination address.
 /// Rounds toward zero (the NGO never loses a unit to rounding).
+///
+/// Computes `amount * fee_bps / 10_000` without an intermediate overflow.
+/// `amount * fee_bps` can exceed `i128::MAX` for a large `amount` even
+/// though `fee_bps` is capped at `MAX_FEE_BPS` (1_000) — a naive
+/// `amount * fee_bps` (or a `saturating_mul` that silently clamps the
+/// overflowed product before dividing) both under-count the fee for such
+/// amounts. Splitting `amount` into a quotient/remainder around the 10_000
+/// divisor first keeps every multiplication in range: `quotient * fee_bps`
+/// is bounded by `amount / 10_000`, and `remainder * fee_bps` is bounded by
+/// `9_999 * 1_000`, both comfortably inside i128. The result is the exact
+/// `floor(amount * fee_bps / 10_000)`, not an approximation of it.
 fn compute_fee(env: &Env, amount: i128) -> i128 {
     let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
     match treasury {
         Some(_) => {
-            let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
-            (amount.saturating_mul(fee_bps as i128) / 10_000).min(amount)
+            let fee_bps = env
+                .storage()
+                .instance()
+                .get::<_, u32>(&DataKey::FeeBps)
+                .unwrap_or(0) as i128;
+            let quotient = amount / 10_000;
+            let remainder = amount % 10_000;
+            (quotient * fee_bps + (remainder * fee_bps) / 10_000).min(amount)
         }
         None => 0,
     }
@@ -255,18 +291,23 @@ fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128)
     net
 }
 
-/// Settles the accrual accumulated since the stream's last checkpoint.
+/// Settles the accrual accumulated since the stream's last checkpoint,
+/// updating `stream`'s in-memory balance/withdrawn/checkpoint fields.
+///
+/// This only mutates `stream`; it never touches persistent storage or moves
+/// tokens. Every caller must persist the mutated `stream` (and only then
+/// pay out the returned accrued amount via `pay_ngo`) so the state update is
+/// durable before any external call — see the "state before transfer"
+/// ordering each call site follows.
 ///
 /// This is shared by every operation that changes a stream's balance or rate
 /// so payout accounting, checked arithmetic, and the checkpoint timestamp
 /// cannot drift between entry points.
-fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
+fn settle(stream: &mut Stream, now: u64) -> Result<i128, Error> {
     let elapsed = now.saturating_sub(stream.last_update);
     let accrued = math::accrued(stream.rate, elapsed, stream.balance);
-    let token_client = token::Client::new(env, &stream.token);
 
     if accrued > 0 {
-        pay_ngo(env, &token_client, &stream.ngo, accrued);
         record_payout(stream, accrued)?;
     }
     stream.last_update = now;
@@ -844,6 +885,14 @@ impl DonationVault {
         if fee_bps > MAX_FEE_BPS {
             return Err(Error::FeeTooHigh);
         }
+        // A non-zero fee with no treasury configured would be silently
+        // dropped by compute_fee, which treats "no treasury" as "no fee"
+        // regardless of fee_bps - fail closed instead of letting the admin
+        // believe a fee is being collected when it never will be.
+        let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+        if fee_bps > 0 && treasury.is_none() {
+            return Err(Error::FeeRequiresTreasury);
+        }
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         extend_instance_ttl(&env);
 
@@ -969,8 +1018,7 @@ impl DonationVault {
             .instance()
             .set(&DataKey::MaxStreamsPerDonor, &limit);
         extend_instance_ttl(&env);
-        env.events()
-            .publish((symbol_short!("maxstrm"),), limit);
+        env.events().publish((symbol_short!("maxstrm"),), limit);
         Ok(())
     }
 
@@ -1285,15 +1333,17 @@ impl DonationVault {
         stream.donor.require_auth();
 
         let now = env.ledger().timestamp();
-        let accrued = settle(&env, &mut stream, now)?;
+        let accrued = settle(&mut stream, now)?;
 
-        let token_client = token::Client::new(&env, &stream.token);
-
+        // Checks-effects-interactions: finish every state change and
+        // persist it before any token transfer below. `withdraw`, `cancel`,
+        // `top_up`, and `deposit` are all gated on `stream.balance` /
+        // `stream.cancelled`, so if the stream isn't fully zeroed-out and
+        // durable *before* we hand control to the token contract, a
+        // malicious or non-standard token could reenter one of those entry
+        // points during `transfer` and observe (and act on) the stale,
+        // pre-cancel stream instead of this cancellation.
         let refund = stream.balance;
-        if refund > 0 {
-            token_client.transfer(&env.current_contract_address(), &stream.donor, &refund);
-        }
-
         stream.balance = 0;
         stream.rate = 0;
         stream.cancelled = true;
@@ -1307,6 +1357,14 @@ impl DonationVault {
             .get(&DataKey::CancelGraceLedgers)
             .unwrap_or(0);
         extend_cancelled_stream_ttl(&env, stream_id, grace_ledgers)?;
+
+        let token_client = token::Client::new(&env, &stream.token);
+        if accrued > 0 {
+            pay_ngo(&env, &token_client, &stream.ngo, accrued);
+        }
+        if refund > 0 {
+            token_client.transfer(&env.current_contract_address(), &stream.donor, &refund);
+        }
 
         // Only emit the cancel event when something actually moved. When
         // both values are zero the stream was already cancelled — emitting
@@ -1369,20 +1427,26 @@ impl DonationVault {
             return Err(Error::StreamCancelled);
         }
 
-        let token_client = token::Client::new(&env, &stream.token);
-
         let now = env.ledger().timestamp();
-        let _accrued = settle(&env, &mut stream, now)?;
-
-        token_client.transfer(&stream.donor, env.current_contract_address(), &amount);
+        let accrued = settle(&mut stream, now)?;
         stream.balance = stream
             .balance
             .checked_add(amount)
             .ok_or(Error::ArithmeticOverflow)?;
 
+        // Checks-effects-interactions: persist the settled accrual and the
+        // new balance before either transfer below, so a reentrant call
+        // during either one observes this top-up (and any settled accrual)
+        // as already applied rather than the stale pre-top-up stream.
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
+
+        let token_client = token::Client::new(&env, &stream.token);
+        if accrued > 0 {
+            pay_ngo(&env, &token_client, &stream.ngo, accrued);
+        }
+        token_client.transfer(&stream.donor, env.current_contract_address(), &amount);
 
         env.events()
             .publish((symbol_short!("topup"), stream_id), amount);
@@ -1441,12 +1505,21 @@ impl DonationVault {
         }
 
         let now = env.ledger().timestamp();
-        let _accrued = settle(&env, &mut stream, now)?;
+        let accrued = settle(&mut stream, now)?;
         stream.rate = new_rate;
 
+        // Checks-effects-interactions: persist the new rate and settled
+        // checkpoint before the payout transfer below, so a reentrant call
+        // during that transfer observes the updated rate rather than the
+        // stale pre-modify one.
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
+
+        if accrued > 0 {
+            let token_client = token::Client::new(&env, &stream.token);
+            pay_ngo(&env, &token_client, &stream.ngo, accrued);
+        }
 
         env.events()
             .publish((symbol_short!("ratemod"), stream_id), (old_rate, new_rate));

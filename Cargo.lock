@@ -630,6 +630,7 @@ dependencies = [
 name = "donation-vault"
 version = "0.1.0"
 dependencies = [
+ "ngo-registry",
  "proptest",
  "soroban-sdk",
 ]
