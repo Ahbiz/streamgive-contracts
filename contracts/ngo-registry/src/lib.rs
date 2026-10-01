@@ -9,7 +9,8 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    String, Vec,
 };
 
 #[contracttype]
@@ -89,6 +90,27 @@ fn require_admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)?;
     admin.require_auth();
     Ok(admin)
+}
+
+fn approve_registered_ngo(env: &Env, ngo_owner: &Address) -> Result<(), Error> {
+    let key = DataKey::Ngo(ngo_owner.clone());
+    let mut ngo: Ngo = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotRegistered)?;
+    if ngo.verified {
+        return Err(Error::AlreadyVerified);
+    }
+    ngo.verified = true;
+    env.storage().persistent().set(&key, &ngo);
+    extend_instance_ttl(env);
+    extend_ngo_ttl(env, ngo_owner);
+
+    env.events()
+        .publish((symbol_short!("approved"), ngo_owner.clone()), ());
+
+    Ok(())
 }
 
 #[contract]
@@ -369,23 +391,19 @@ impl NgoRegistry {
     /// ```
     pub fn approve_ngo(env: Env, ngo_owner: Address) -> Result<(), Error> {
         require_admin(&env)?;
+        approve_registered_ngo(&env, &ngo_owner)
+    }
 
-        let key = DataKey::Ngo(ngo_owner.clone());
-        let mut ngo: Ngo = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotRegistered)?;
-        if ngo.verified {
-            return Err(Error::AlreadyVerified);
+    /// Marks each registered NGO as verified. Admin-only. Fails with
+    /// `Error::NotRegistered` or `Error::AlreadyVerified` if any owner
+    /// cannot be approved; a failed invocation leaves the entire batch
+    /// unchanged.
+    pub fn batch_approve(env: Env, owners: Vec<Address>) -> Result<(), Error> {
+        require_admin(&env)?;
+
+        for ngo_owner in owners.iter() {
+            approve_registered_ngo(&env, &ngo_owner)?;
         }
-        ngo.verified = true;
-        env.storage().persistent().set(&key, &ngo);
-        extend_instance_ttl(&env);
-        extend_ngo_ttl(&env, &ngo_owner);
-
-        env.events()
-            .publish((symbol_short!("approved"), ngo_owner), ());
 
         Ok(())
     }
