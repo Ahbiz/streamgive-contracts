@@ -8,7 +8,7 @@ donation flows end to end — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Contracts
 
-- `ngo-registry` — on-chain NGO application, verification, and registry
+- `ngo-registry` — on-chain NGO application, verification, and registry. `register` and `update_name` cap `name` at 200 bytes (`Error::NameTooLong` otherwise), matching the backend's own 200-char limit.
 - `donation-vault` — streaming donation vault (create / withdraw / cancel / modify streams)
 
 ## Release profile
@@ -44,12 +44,12 @@ where it was and there is nothing to unwind when the pause is lifted.
 While the vault is paused, every entry point that moves tokens or changes
 a stream rejects the call with `Error::ContractPaused` (code 6) before
 touching storage or requiring any auth:
+
 Note that pausing does **not** stop time-based accrual. A stream's
 `pending_accrual` keeps growing while the vault is paused, so a stream
 paused for a week still owes a week of accrual once the pause is lifted.
 That accrual is claimable via `withdraw` as soon as the vault is
 unpaused.
-
 
 | Entry point     | While paused                                    |
 | --------------- | ----------------------------------------------- |
@@ -58,7 +58,6 @@ unpaused.
 | `top_up`        | Rejected                                        |
 | `modify_rate`   | Rejected                                        |
 | `cancel_stream` | Still works — settles and refunds as usual      |
-
 
 `withdraw` being on that list is the point of the brake: it is the only
 path that pays tokens straight out of the vault, so a pause triggered by a
@@ -103,9 +102,22 @@ Notable coverage:
   (`invariants_hold_across_a_grid_of_inputs`) that checks, across a
   matrix of rates, balances, and elapsed durations, that accrual is
   always non-negative, never exceeds the remaining balance, and is
-  monotonically non-decreasing as elapsed time (or rate) grows — a
-  stand-in for property-based testing over the streaming math's edge
-  cases.
+  monotonically non-decreasing as elapsed time (or rate) grows.
+- A `proptest`-based `fuzz` module checks the same invariants (plus
+  monotonicity in balance and agreement with exact arithmetic) against
+  randomly generated `rate`/`elapsed`/`balance` inputs, biased towards
+  the zero and near-`MAX` edges.
+
+To run the full local check before pushing (formatting, clippy, then
+tests, stopping on the first failure):
+
+```sh
+make check
+```
+
+This runs `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace`, matching what CI runs.
 
 CI (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
 `cargo fmt --check`, `cargo clippy`, a `wasm32v1-none` release
@@ -167,8 +179,8 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
 | 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
 | 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
-| 9    | `ArithmeticOverflow`  | A stream balance, withdrawn total, or stream ID would exceed its integer range. |
-| 10   | `DepositTooLow`       | `create_stream` was called with a deposit below the admin-configured minimum. |
+| 9    | `ArithmeticOverflow`  | A balance, payout, or stream-id calculation exceeded its supported range. |
+| 10   | `DepositTooLow`       | `create_stream` received a deposit below the configured minimum. |
 | 11   | `AlreadyPaused`       | `pause` was called when the vault was already paused. |
 | 12   | `AlreadyUnpaused`     | `unpause` was called when the vault was already active. |
 | 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
@@ -177,6 +189,9 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 16   | `NgoNotVerified`      | `create_stream` targeted an NGO that isn't verified in the configured registry. |
 | 17   | `StreamLimitExceeded` | The donor already has `max_streams_per_donor` open streams.              |
 | 18   | `StreamCounterMissing`| `NextStreamId` was missing from instance storage (should not happen after `init`). |
+| 16   | `StreamLimitExceeded` | `create_stream` would push the donor's open-stream count past `max_streams_per_donor`. |
+| 17   | `NgoNotVerified`      | A registry is configured and the NGO isn't registered there or isn't approved yet. |
+| 18   | `StreamCounterMissing`| The stream-id counter was missing from storage at `create_stream` time (the contract was never `init`ed). |
 
 ### `ngo-registry`
 
@@ -187,8 +202,9 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 | 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
 | 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
 | 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
-| 6    | `InvalidName`         | `register` was called with a zero-length name.                   |
+| 6    | `NameTooLong`         | `register` or `update_name` was called with a `name` longer than `MAX_NGO_NAME_LEN` (200 bytes). |
 | 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
+| 8    | `ArithmeticOverflow`  | The total NGO counter could not be incremented without exceeding its range. |
 
 ## Status
 
