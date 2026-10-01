@@ -1726,6 +1726,29 @@ fn modify_rate_rejects_non_positive_rate() {
 }
 
 #[test]
+fn modify_rate_at_creation_ledger_settles_nothing_but_applies_new_rate() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // modify_rate called in the same ledger as create_stream: last_update
+    // equals `now`, so elapsed is zero and nothing should settle.
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.modify_rate(&stream_id, &20);
+
+    assert_eq!(s.token.balance(&s.ngo), 0);
+    assert_eq!(s.token.balance(&s.client.address), 1_000);
+
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 1_000);
+    assert_eq!(stream.withdrawn, 0);
+    // The new rate still takes effect even though nothing settled.
+    assert_eq!(stream.rate, 20);
+    assert_eq!(stream.last_update, stream.created_at);
+}
+
+#[test]
 fn modify_rate_on_cancelled_stream_fails() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
