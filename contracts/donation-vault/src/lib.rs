@@ -10,6 +10,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Vec,
 };
 
 mod math;
@@ -60,16 +61,33 @@ pub enum StreamStatus {
     Drained,
 }
 
+/// Admin-set vault configuration, returned together by `get_config`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub paused: bool,
+    pub treasury: Option<Address>,
+    pub fee_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
     PendingAdmin,
+    /// Set by `renounce_admin`. Distinguishes a vault whose admin permanently
+    /// stepped down from one that was never initialized, and blocks `init`
+    /// from installing a new admin afterwards.
+    AdminRenounced,
     NextStreamId,
     Stream(u64),
     Paused,
     Treasury,
     FeeBps,
+    /// The token allowlist surfaced to frontend token pickers. See
+    /// [`allowed_tokens`](DonationVault::allowed_tokens); empty until an
+    /// operator configures one.
+    AllowedTokens,
     /// Admin-settable per-donor stream cap. See `set_max_streams_per_donor`.
     MaxStreamsPerDonor,
     /// Count of streams a donor currently has open. Incremented on
@@ -129,6 +147,10 @@ pub enum Error {
     NgoNotVerified = 17,
     /// The proposed administrator is not a valid replacement.
     InvalidAdmin = 18,
+    /// The admin has renounced control, so admin-gated calls are permanently
+    /// disabled. 19, not 16: 16 is `StreamLimitExceeded` on this branch, and
+    /// reusing it would make the two errors compare equal.
+    AdminRenounced = 19,
 }
 
 /// Fee cap of 10%, enforced by `set_fee_bps` so the admin can never take
@@ -189,7 +211,17 @@ fn extend_cancelled_stream_ttl(env: &Env, stream_id: u64, grace_ledgers: u32) ->
 /// `Error::NotInitialized` if `init` hasn't been called yet. Shared by
 /// every admin-gated entry point so the same three steps aren't repeated
 /// at each call site.
+fn admin_renounced(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::AdminRenounced)
+        .unwrap_or(false)
+}
+
 fn require_admin(env: &Env) -> Result<Address, Error> {
+    if admin_renounced(env) {
+        return Err(Error::AdminRenounced);
+    }
     let admin: Address = env
         .storage()
         .instance()
@@ -312,6 +344,9 @@ impl DonationVault {
     /// client.init(&admin);
     /// ```
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+        if admin_renounced(&env) {
+            return Err(Error::AdminRenounced);
+        }
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -321,6 +356,40 @@ impl DonationVault {
         env.storage()
             .instance()
             .set(&DataKey::CancelGraceLedgers, &0u32);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Permanently gives up admin control. Admin-authed.
+    ///
+    /// Clears the stored admin and any pending admin proposal, and records
+    /// that control was renounced. After this call every admin-gated entry
+    /// point fails with `Error::AdminRenounced`, and `init` cannot install a
+    /// replacement. This cannot be undone.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// client.renounce_admin();
+    /// assert!(client.try_pause().is_err());
+    /// ```
+    pub fn renounce_admin(env: Env) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage().instance().remove(&DataKey::Admin);
+        if env.storage().instance().has(&DataKey::PendingAdmin) {
+            env.storage().instance().remove(&DataKey::PendingAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminRenounced, &true);
         extend_instance_ttl(&env);
         Ok(())
     }
@@ -341,6 +410,9 @@ impl DonationVault {
     /// assert_eq!(client.admin(), admin);
     /// ```
     pub fn admin(env: Env) -> Result<Address, Error> {
+        if admin_renounced(&env) {
+            return Err(Error::AdminRenounced);
+        }
         env.storage()
             .instance()
             .get(&DataKey::Admin)
@@ -586,6 +658,55 @@ impl DonationVault {
         Ok(math::accrued(stream.rate, elapsed, stream.balance))
     }
 
+    /// Read-only lookup of the ledger timestamp at which a stream's balance
+    /// runs out, so every client gets the same answer with the rounding done
+    /// in one place. The stream's `balance` counts everything not yet paid
+    /// out (including what's accrued but unwithdrawn) and `last_update` is
+    /// when it was last settled, so this is `last_update` plus the seconds
+    /// `balance` takes at `rate`, rounded up — a partial final second counts
+    /// as a whole one.
+    ///
+    /// Returns `None` when the stream will never deplete: a cancelled or
+    /// zero-rate stream, or a timestamp too far out to represent. An already
+    /// empty stream that still has a rate returns its `last_update`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, token, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &1_000);
+    /// // 1_000 units at 300/s take 3.33s, so the stream ends at second 4.
+    /// let stream_id = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &300);
+    /// let created_at = client.get_stream(&stream_id).created_at;
+    /// assert_eq!(client.depletion_time(&stream_id), Some(created_at + 4));
+    ///
+    /// // A cancelled stream never depletes.
+    /// client.cancel_stream(&stream_id);
+    /// assert_eq!(client.depletion_time(&stream_id), None);
+    /// ```
+    pub fn depletion_time(env: Env, stream_id: u64) -> Result<Option<u64>, Error> {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+
+        Ok(math::seconds_to_deplete(stream.rate, stream.balance)
+            .and_then(|seconds| stream.last_update.checked_add(seconds)))
+    }
+
     /// Read-only view of the net amount the NGO would actually receive and the
     /// fee that would be taken if `withdraw` were called right now.
     ///
@@ -756,6 +877,19 @@ impl DonationVault {
             .unwrap_or(false)
     }
 
+    /// Reads back all admin-set configuration in one call.
+    pub fn get_config(env: Env) -> Config {
+        Config {
+            paused: env
+                .storage()
+                .instance()
+                .get(&DataKey::Paused)
+                .unwrap_or(false),
+            treasury: env.storage().instance().get(&DataKey::Treasury),
+            fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+        }
+    }
+
     /// Sets where the protocol fee (if any) gets paid. Admin-gated.
     ///
     /// # Examples
@@ -886,6 +1020,15 @@ impl DonationVault {
     /// ```
     pub fn fee_bps(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
+    }
+
+    /// Returns the configured token allowlist for frontend token pickers.
+    /// Until an allowlist is configured, this returns an empty vector.
+    pub fn allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Sets the minimum `deposit` accepted by `create_stream`, letting an
