@@ -67,9 +67,9 @@ funds while the rest of the contract is frozen.
 `cancel_stream` is deliberately left open. It is the one path that returns
 money to a donor, so keeping it available means a pause can never trap a
 donor's unspent deposit. The read-only views (`admin`, `pending_admin`,
-`get_stream`, `stream_count`, `pending_accrual`, `paused`, `treasury`,
-`fee_bps`) and `extend_stream` also keep working, since none of them can
-move funds, and `unpause` is of course still reachable.
+`get_stream`, `stream_count`, `streams_by_donor`, `pending_accrual`, `paused`,
+`treasury`, `fee_bps`) and `extend_stream` also keep working, since none of
+them can move funds, and `unpause` is of course still reachable.
 
 ## Related repositories
 

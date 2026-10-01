@@ -1912,6 +1912,85 @@ fn create_stream_stores_every_field() {
 }
 
 #[test]
+fn streams_by_donor_is_empty_before_any_stream() {
+    let s = setup();
+    assert_eq!(s.client.streams_by_donor(&s.donor).len(), 0);
+}
+
+#[test]
+fn streams_by_donor_lists_a_single_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let ids = s.client.streams_by_donor(&s.donor);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids.get(0), Some(stream_id));
+}
+
+#[test]
+fn streams_by_donor_lists_multiple_streams_in_creation_order() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    let first = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let second = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &20);
+    let third = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &30);
+
+    let ids = s.client.streams_by_donor(&s.donor);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids.get(0), Some(first));
+    assert_eq!(ids.get(1), Some(second));
+    assert_eq!(ids.get(2), Some(third));
+}
+
+#[test]
+fn streams_by_donor_keeps_cancelled_stream_ids_listed() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.client.cancel_stream(&stream_id);
+
+    // Cancelling doesn't delete the stream record, so its id stays listed;
+    // callers use get_stream to check its status.
+    let ids = s.client.streams_by_donor(&s.donor);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids.get(0), Some(stream_id));
+}
+
+#[test]
+fn streams_by_donor_is_per_donor() {
+    let s = setup();
+    let donor_b = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &1_000);
+    s.token_admin.mint(&donor_b, &1_000);
+
+    let donor_a_stream = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let donor_b_stream = s
+        .client
+        .create_stream(&donor_b, &s.ngo, &s.token.address, &1_000, &10);
+
+    let donor_a_ids = s.client.streams_by_donor(&s.donor);
+    assert_eq!(donor_a_ids.len(), 1);
+    assert_eq!(donor_a_ids.get(0), Some(donor_a_stream));
+
+    let donor_b_ids = s.client.streams_by_donor(&donor_b);
+    assert_eq!(donor_b_ids.len(), 1);
+    assert_eq!(donor_b_ids.get(0), Some(donor_b_stream));
 fn stream_ids_are_sequential_and_stream_count_tracks_them() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000_000);
